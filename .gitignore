@@ -1,0 +1,24 @@
+# local working docs
+CLAUDE.md
+PLAN.md
+.claude/
+
+# results, renders, recorded runs
+out/
+bench/RESULTS.md
+
+# reference clones
+refs/
+compas/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.venv-cra/
+.pytest_cache/
+.hypothesis/
+
+# os
+.DS_Store
