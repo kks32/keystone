@@ -1,6 +1,7 @@
 # local working docs
 CLAUDE.md
 PLAN.md
+tropes.md
 .claude/
 
 # results, renders, recorded runs
