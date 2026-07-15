@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "keystone"
+version = "0.0.1"
+description = "Rigid-block equilibrium for 2D and 3D box assemblies. Certified convex solvers in JAX, batched; load-gradient support today, pose and friction gradients planned."
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "jax>=0.4.30",
+    "qpax>=0.1.3",
+]
+
+[project.optional-dependencies]
+viz = ["matplotlib>=3.8"]
+dev = ["pytest>=8", "hypothesis>=6", "matplotlib>=3.8"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/keystone"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

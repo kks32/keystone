@@ -7,6 +7,7 @@ tropes.md
 # results, renders, recorded runs
 out/
 bench/RESULTS.md
+bench/SEARCH_RESULTS.md
 
 # reference clones
 refs/
