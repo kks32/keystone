@@ -63,6 +63,8 @@ class Search:
         screener="qpax",
         pdhg_iters=400,
         pdhg_accel=True,
+        prior_fn=None,
+        value_fn=None,
     ):
         self.n = n
         self.dx = dx
@@ -70,6 +72,16 @@ class Search:
         self.c_puct = c_puct
         self.K = int(batch)
         self.rng = np.random.default_rng(seed)
+        # Optional learned-search hooks. prior_fn(state_key, action_indices)
+        # returns a prior probability vector over those actions, replacing the
+        # uniform PUCT prior. value_fn(state_key) returns a scalar in [0, 1]
+        # replacing the heuristic value at a non-terminal leaf. Both default to
+        # None, which reproduces the uniform-prior heuristic-value search
+        # exactly: every new code path is guarded on `is not None`, so the None
+        # path runs the same arithmetic as before. Certification is untouched;
+        # the hooks only shape exploration.
+        self.prior_fn = prior_fn
+        self.value_fn = value_fn
         # qpax iteration cap for the search oracle. Matches the naive default.
         # Fewer iterations only flip a near-boundary state from feasible to
         # infeasible (conservative), so a state called feasible here is
@@ -140,6 +152,7 @@ class Search:
             "N": 0,
             "N_a": {},
             "W_a": {},
+            "P_a": {},  # learned priors per action, filled only when prior_fn set
         }
         self.tree[key] = node
         return node
@@ -150,6 +163,16 @@ class Search:
 
     def _child_key(self, key, action):
         return self._canonical(key + (action,))
+
+    def _action_index(self, action):
+        """Layer-major grid index of an (layer, xidx) action.
+
+        Matches lattice.action_grid: index = layer * n_pos + (xidx - j_lo).
+        The index is the same integer a learned model uses for this action,
+        because the model shares the layer-major convention and the same n_pos.
+        """
+        layer, xidx = action
+        return layer * self.spec.n_pos + (xidx - self.spec.j_lo)
 
     # --- feasibility oracle ----------------------------------------------
 
@@ -402,6 +425,13 @@ class Search:
                         self.best_parent = node["key"]
                         self.best_action = a
             node["actions"] = admissible
+            # Learned priors over the admissible actions. Computed once at
+            # expansion and frozen, as in AlphaZero. When prior_fn is None the
+            # dict stays empty and _puct_action falls back to the uniform prior.
+            if self.prior_fn is not None and admissible:
+                idxs = [self._action_index(a) for a in admissible]
+                pri = self.prior_fn(node["key"], idxs)
+                node["P_a"] = {a: float(p) for a, p in zip(admissible, pri)}
             node["terminal"] = len(node["key"]) >= self.n or not admissible
             if node["terminal"]:
                 node["solved"] = True
@@ -431,7 +461,9 @@ class Search:
                 continue
             na = node["N_a"][a]
             q = node["W_a"][a] / na if na > 0 else 0.0
-            u = self.c_puct * prior * sqrt_n / (1.0 + na)
+            # Uniform prior by default; the learned prior when prior_fn is set.
+            p = prior if self.prior_fn is None else node["P_a"][a]
+            u = self.c_puct * p * sqrt_n / (1.0 + na)
             score = q + u
             if score > best_score:
                 best_score = score
@@ -484,7 +516,12 @@ class Search:
         if ov == float("-inf"):
             ov = 0.0
         if node["terminal"]:
+            # A terminal leaf has an exact overhang value; never a heuristic,
+            # so value_fn does not apply here.
             v = ov / self.value_norm
+        elif self.value_fn is not None:
+            # Learned value replaces the optimistic heuristic at a leaf.
+            v = self.value_fn(node["key"])
         else:
             remaining = self.n - len(node["key"])
             v = (ov + 0.25 * remaining) / self.value_norm
