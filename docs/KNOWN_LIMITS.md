@@ -519,3 +519,65 @@ position-controlled arm clears the fingers by a wide margin yet rams the bridge:
 the open problem is arm compliance, not clearance. Numbers:
 out/mujoco/mujoco_rideunder.json; movie out/mujoco/rideunder_clamp_26_24.mp4 (and
 .gif); Franka attempt out/mujoco/rideunder_franka_14.mp4.
+
+## Ride-under phase 2 fix: side approach plus admittance stops the prying (2026-07-16)
+
+The phase-2 blocker above (the stiff position-controlled arm drags the bridge
+237 mm while leveling) is fixed by two changes in examples/mujoco_rideunder.py
+phase2_execution, both required. First, a side approach: franka_scene.compose_scene
+grows an arm_base_pos/arm_base_yaw kwarg (default None keeps the front build
+bit-for-bit) and the arm is rebased beside the build plane in -y, yawed to face
+the structure, so the ride-under push (along -x) is perpendicular to the approach
+and no arm link arches over the structure. Second, the contact thread runs a
+force-aware outer loop (admittance, PLAN.md option b): each control step it
+measures the reacher-on-structure reaction (horizontal push drag plus vertical
+bridge lift), advances the commanded thread only while both stay under the phase-1
+caps (push 4 reacher-weights, a 2.5 N bridge-lift cap standing in for the leveling
+torque), and recedes otherwise. Free-space moves (pick, carry) keep the stiff
+servo for accuracy; only the thread is admittance.
+
+Result on 26/24, pre-stack teleported to certified poses (phase-1 protocol, so
+the push is compared like for like). Bridge disturbance drops from 237 mm to
+3.0 mm return (3.2 mm peak during the push), a 74x cut; the ballast moves 0.5 mm
+and rotates 0.37 deg (was 50 mm dropped and a collapse). The reacher-on-structure
+push peaks at 5.3 N (2.2 reacher-weights, under the 9.8 N cap) and the bridge lift
+at 2.7 N, both near the phase-1 driver profile (which used about 1.0 N because a
+6-DOF compliant driver needs less). The reacher seats flat (tilt 0.02 deg) with an
+11.8 mm clamp overlap. So the documented blocker is real and the admittance push
+removes it: the arm no longer rams.
+
+What the arm still cannot do, and why. The seated state is settle-marginal: the
+stiff-contact settle flags it unstable, but on the displacement channel only
+(rotation stays 0.009 rad, 0.5 deg, under the 0.01 threshold, so it does not
+topple), because the pushed reacher lands about 4.7 mm off the ideal seat where
+phase-1's exact placement lands 0. A two-finger gripper has no pitch authority
+about the pinch axis (measured: commanding 4 deg nose-down, the grip holds -2 to
++1 deg, wandering 5 deg under MuJoCo's regularized pad contact), so the reacher
+tilt is set by the base contact and the grasp height rather than the wrist, and
+the deep thread that clamps best also leaves the largest residual offset. The
+ride-under has no closed-loop seat correction (the block is pushed, not placed),
+where franka_build's drops reach 0.5 mm with a vision-in-the-loop press; adding
+that here is future work. The arm executes the push and seats the clamp with the
+prying fixed, but does not reproduce phase-1's clean stand.
+
+Two side findings, both recorded because they are negative results. The 180 deg
+end base (arm beyond the overhang in +x, pushing -x away from itself) has the
+best manipulability on paper, and Krishna proposed pushing the trailing face with
+closed fingertips (no grasp during the push, which would remove the pitch and
+finger-clearance questions). It does not work as a released push: a free reacher
+tilted on its leading corner tips over the instant the grip opens (measured 110
+deg flop, no continuous support), and with the reachable top-grasp orientation the
+end base fouls the counterweight during the carry (the horizontal -x push
+orientation the idea needs is unreachable at that low height, 48 mm IK residual;
+only tool tilts up to 35 deg from vertical are reachable). The side base is the
+one that executes. Second, the full one-handed build (three arm-drops then the
+push) fails at the drops, not the push: the base drops to 4.6 mm but the
+knife-edge counterweight cantilever (center of mass on the base edge, caught by
+its falsework prop) lands 75 mm off and topples, because the ride-under drop
+routine lacks the closed-loop alignment and press that franka_build spends its
+BuildDriver on. The pre-stack therefore stands only when teleported to certified
+poses; the arm-drop of the propped knife-edge is the remaining gap for a true
+one-handed build. 29/24 rams under the arm (bridge 186 mm) exactly as its seated
+knife-edge is scale-marginal in phase 1. Numbers and both-base comparison:
+out/mujoco/mujoco_rideunder.json (phase2.executions); movie
+out/mujoco/rideunder_franka_14.mp4.

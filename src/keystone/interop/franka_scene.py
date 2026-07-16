@@ -241,6 +241,8 @@ def compose_scene(
     prop_kv: float = 1.0e3,
     grip_kp: float = 1000.0,
     grip_kv: float = 30.0,
+    arm_base_pos: np.ndarray | None = None,
+    arm_base_yaw: float = 0.0,
 ):
     """Compose the full build scene in memory. Returns (spec, SceneInfo).
 
@@ -248,11 +250,23 @@ def compose_scene(
     meshes. Added: a ground plane, a static pedestal, the design cubes as free
     bodies in the staging row, the two falsework props on position-actuated
     sliders, a TCP site on the hand, and the explicit contact pairs. Compile the
-    returned spec with spec.compile()."""
+    returned spec with spec.compile().
+
+    arm_base_pos, arm_base_yaw place the panda base body (link0) beside the
+    structure for a side approach. Default (None, 0.0) keeps link0 at the world
+    origin, reproducing the top-down front build of examples/franka_build.py. A
+    non-None arm_base_pos moves the base to that world point; arm_base_yaw
+    rotates it about world z (radians) so the arm faces the structure. The
+    structure, staging, and props are unaffected; only the arm is repositioned."""
     import mujoco
 
     base_offset = np.asarray(base_offset, dtype=np.float64)
     spec = mujoco.MjSpec.from_file(PANDA_XML)
+    if arm_base_pos is not None:
+        link0 = spec.body("link0")
+        link0.pos = np.asarray(arm_base_pos, dtype=np.float64).tolist()
+        a = 0.5 * float(arm_base_yaw)
+        link0.quat = [np.cos(a), 0.0, 0.0, np.sin(a)]
     spec.option.timestep = timestep
     spec.option.solver = mujoco.mjtSolver.mjSOL_NEWTON
     # HD offscreen framebuffer with multisampling for movie rendering.

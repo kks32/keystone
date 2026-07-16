@@ -568,8 +568,38 @@ def _encode_frames(frames, out_dir, name, fps=25, gif=True):
 
 
 # --------------------------------------------------------------------------
-# Phase 2: Franka execution (place-then-push with a real arm).
+# Phase 2: Franka execution (side approach + admittance ride-under).
 # --------------------------------------------------------------------------
+#
+# The first phase-2 attempt (joint-position control, front top-grasp) failed:
+# the stiff joint servos imposed the reacher pose rigidly, so leveling dragged
+# the bridge 237 mm through the held block and the structure collapsed, where
+# the phase-1 force-capped driver reseated the bridge to 1.6 mm. Two compounding
+# causes, both fixed here.
+#
+# 1. Side approach. The panda base is rebased beside the build plane, offset in
+#    y from the structure line and yawed to face it (franka_scene.compose_scene
+#    arm_base_pos/arm_base_yaw; the structure, staging, and props are unmoved).
+#    The design is planar in xz, so the whole y-corridor is free. The arm reaches
+#    the structure laterally and the ride-under push (along -x) is perpendicular
+#    to the approach (-y), so the forearm stays in the free y-corridor and never
+#    arches over the structure at near-full extension (the posture Krishna flagged
+#    in the video). Grasp: the top-down y-pinch of franka_build (fingers straddle
+#    the block across the free y-faces, wrist above the trailing end). The grip
+#    sits near the trailing (+x) end; the bridge overlaps only the leading tail,
+#    so the pads and the hand pass well clear of the bridge through the whole push
+#    (clearances measured with mj_geomDistance and reported).
+#
+# 2. Admittance contact (option b). Free-space moves (pick, carry) keep the stiff
+#    servo for placement accuracy. The ride-under thread switches to a force-aware
+#    outer loop: every control step it measures the reacher-on-structure reaction
+#    (horizontal push drag and vertical bridge lift), advances the commanded TCP
+#    only while both stay under caps, and recedes when either exceeds its cap.
+#    The caps are phase 1's (push 4 reacher-weights; a bridge-lift cap stands in
+#    for the leveling-torque cap). The reacher rides in nose-down; the bridge
+#    presses it flat as it threads (self-leveling), laying itself back down; the
+#    grip opens after a dwell and the clamp settles. This is transparent and
+#    deterministic: fixed step counts, fixed IK iterations, no randomness.
 
 
 def phase2_clearance():
@@ -598,42 +628,115 @@ def _set_free(model, data, body, pos, quat):
     data.qpos[jadr + 3:jadr + 7] = quat
 
 
+def _qmul(a, b):
+    """Hamilton product of two (w, x, y, z) quaternions."""
+    aw, ax, ay, az = a
+    bw, bx, by, bz = b
+    return np.array([
+        aw * bw - ax * bx - ay * by - az * bz,
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+    ])
+
+
 def _tilt_grasp_quat(deg):
-    """Top-grasp quaternion (tool z down) pitched nose-down by deg about world y."""
+    """Top-grasp wrist quaternion (tool z down) pitched nose-down by deg about y.
+
+    The nose-down rotation is applied to the world-z-down top grasp so the reacher
+    is held on the correct tilt axis. At deg = 0 this is the plain top grasp
+    (0, 0, 1, 0) used for the flat drops."""
     a = -np.radians(deg) / 2.0
-    yq = np.array([np.cos(a), 0.0, np.sin(a), 0.0])
-    b = np.array([0.0, 0.0, 1.0, 0.0])
-    return np.array([yq[0] * b[0] - yq[2] * b[2], yq[0] * b[1] + yq[2] * b[3],
-                     yq[0] * b[2] + yq[2] * b[0], yq[0] * b[3] - yq[2] * b[1]])
+    return _qmul(np.array([np.cos(a), 0.0, 0.0, np.sin(a)]),
+                 np.array([0.0, 0.0, 1.0, 0.0]))
 
 
-def phase2_execution(reacher_j, tilt_deg, out_dir, *, ts=5e-4, movie=True):
-    """Attempt the ride-under with the menagerie Franka: pick the reacher from
-    staging, carry it in clear of the structure, and push it under the bridge
-    with a wrist pitch, then release and settle. Reuses franka_scene composition
-    and IK; the falsework props are retracted (the pre-stack stands prop-free).
+# Side approach. The panda base sits beside the structure in -y (the staging
+# side, so the picks stay in reach) and yaws +90 deg to face the build plane at
+# y = 0. The y-corridor is symmetric; -y is the reachable choice. Staging is a
+# row on the floor at SIDE_STAGE_Y, one x per cube.
+SIDE_BASE_POS = np.array([0.45, -0.45, 0.0])
+SIDE_BASE_YAW = np.pi / 2.0
+SIDE_STAGE_Y = -0.10
+SIDE_STAGE_X = (0.30, 0.479, 0.36, 0.42)  # base, reacher, counterweight, bridge
+# The thread stops lowering the reacher this far above the flat seat height, so
+# it ends a hair nose-down (leading top clamped under the bridge) rather than
+# pressed nose-up (leading top popping out). Tuned for a clean stand.
+Z_END_MARGIN = float(os.environ.get("RU_ZEND", "0.0025"))
 
-    Instruments the pad-bridge clearance and the bridge and ballast motion, and
-    returns the outcome. The pre-stack is teleported to its certified poses (this
-    is the reacher-insertion step; the pre-stack build is the falsework demo)."""
+
+def _ang(q0, q1):
+    """Geodesic angle in radians between two (w, x, y, z) quaternions."""
+    dot = min(1.0, abs(float(np.dot(np.asarray(q0), np.asarray(q1)))))
+    return 2.0 * float(np.arccos(dot))
+
+
+def _grasp_world(cx, cz, deg, grasp_dx):
+    """World grasp point near the trailing (+x) end of a reacher centered at
+    (cx, cz) and pitched nose-down by deg about world y."""
+    a = -np.radians(deg)
+    R = np.array([[np.cos(a), 0, np.sin(a)], [0, 1, 0], [-np.sin(a), 0, np.cos(a)]])
+    return np.array([cx, 0.0, cz]) + R @ np.array([grasp_dx, 0.0, 0.0])
+
+
+def phase2_execution(reacher_j, tilt_deg, cap_x, out_dir, *, ts=5e-4, movie=True,
+                     do_drops=True, approach="side"):
+    """Execute the ride-under build one-handed with the menagerie Franka.
+
+    approach selects the arm base placement, both a pure lateral base with the
+    push perpendicular to the approach so no link crosses the structure:
+      "side" base beside the plane in -y (yaw +90 deg), push along -x;
+      "end"  base beyond the overhang in +x (yaw 180 deg), pushing -x directly
+             away from the base (best manipulability). Staging follows the base.
+    The push method is the same grasp-thread admittance in both.
+
+    Side base (compose_scene arm_base_pos/arm_base_yaw). The three pre-stack
+    cubes (base, counterweight, bridge) are dropped from the side by top-grasp
+    y-pinch; the counterweight is caught by its falsework prop, which reads zero
+    load once the bridge lands (the bridge stabilizes the knife-edge cantilever)
+    and retracts after the reacher seats. The reacher is picked, carried tilted
+    to the base top, and pushed under the bridge with the admittance thread: the
+    commanded TCP advances only while the reacher-on-structure reaction stays
+    under the phase-1 caps (push cap_x reacher-weights, bridge-lift cap), and
+    recedes otherwise. Grip opens after a dwell; the clamp settles. The verdict
+    is a stiff-contact settle of the extracted poses, as in phase 1.
+
+    Instruments pad and hand clearance to the bridge over the whole push
+    (mj_geomDistance), bridge and ballast disturbance, the push-force profile,
+    seated pose error, and the settle verdict. Returns the report dict."""
     import mujoco
     from keystone.interop.franka_scene import (
         BASE_OFFSET, DX_GRID, GRIPPER_CLOSE, GRIPPER_OPEN, compose_scene,
         dls_ik, reset_home,
     )
 
-    spec, info = compose_scene(timestep=ts)
+    if approach == "end":
+        base_pos, base_yaw = np.array([1.0, 0.0, 0.0]), np.pi
+        stage_y, carry_y = 0.0, 0.0
+        stage_x = (0.60, 0.66, 0.72, 0.78)  # base, reacher, counterweight, bridge
+    else:
+        base_pos, base_yaw = SIDE_BASE_POS, SIDE_BASE_YAW
+        stage_y, carry_y = SIDE_STAGE_Y, SIDE_STAGE_Y
+        stage_x = SIDE_STAGE_X
+    spec, info = compose_scene(timestep=ts, arm_base_pos=base_pos,
+                               arm_base_yaw=base_yaw)
     model = spec.compile()
     d = mujoco.MjData(model)
     scr = mujoco.MjData(model)
     reset_home(model, d)
 
     tgt = info.target_world
-    _set_free(model, d, "cube0", tgt[0], [1, 0, 0, 0])   # base
-    _set_free(model, d, "cube2", tgt[2], [1, 0, 0, 0])   # counterweight
-    _set_free(model, d, "cube3", tgt[3], [1, 0, 0, 0])   # bridge
+    # Stage the four cubes on the floor at the staging row for this base.
+    for i, sx in enumerate(stage_x):
+        _set_free(model, d, f"cube{i}", [sx, stage_y, 0.5 * S], [1, 0, 0, 0])
+    # Counterweight prop stays extended (catches the drop); reacher prop retracts.
+    cw_prop = next((p for p in info.props if p["supports"] == 2), None)
+    cw_prop_aid = model.actuator(cw_prop["act"]).id if cw_prop else None
+    cw_prop_geom = model.geom(cw_prop["geom"]).id if cw_prop else None
+    cw_prop_retract = cw_prop["retract_disp"] if cw_prop else 0.0
     for p in info.props:
-        d.ctrl[model.actuator(p["act"]).id] = p["retract_disp"]
+        if p["supports"] != 2:
+            d.ctrl[model.actuator(p["act"]).id] = p["retract_disp"]
     mujoco.mj_forward(model, d)
 
     sid = model.site(info.tcp_site).id
@@ -642,32 +745,37 @@ def phase2_execution(reacher_j, tilt_deg, out_dir, *, ts=5e-4, movie=True):
     bid = model.body("cube3").id
     base_bid = model.body("cube0").id
     cw_bid = model.body("cube2").id
+    cube_bid = [model.body(f"cube{i}").id for i in range(4)]
     pad_g = [model.geom(g).id for g in info.finger_pads]
     bgeom = model.geom("cube3_geom").id
+    basegeom = model.geom("cube0_geom").id
+    rgeom = model.geom("cube1_geom").id
+    # Hand-and-finger collision geoms (group 3; the physical envelope, not the
+    # visual meshes) for the clearance of the whole hand, not just the pads.
+    hand_bids = {model.body(b).id for b in ("hand", "left_finger", "right_finger")}
+    hand_g = [g for g in range(model.ngeom)
+              if int(model.geom_bodyid[g]) in hand_bids
+              and int(model.geom_group[g]) == 3]
+    rw = float(model.body_mass[rid]) * G
+    max_push = cap_x * rw
+    lift_cap = 2.5  # bridge-lift cap (leveling), newtons
+
     frames = []
     cam = None
     renderer = {"r": None}
     if movie:
         cam = mujoco.MjvCamera()
         mujoco.mjv_defaultFreeCamera(model, cam)
-        cam.lookat[:] = [0.44, -0.02, 0.12]
-        cam.distance = 0.62
-        cam.azimuth = 138.0
-        cam.elevation = -14.0
-    metrics = {"pad_bridge": 0.0, "nstep": 0}
+        cam.lookat[:] = [0.44, -0.04, 0.14]
+        cam.distance = 0.85
+        cam.azimuth = 60.0
+        cam.elevation = -16.0
+    metrics = {"nstep": 0, "pad_bridge_N": 0.0}
 
-    def step():
+    def step(capture=True):
         mujoco.mj_step(model, d)
         metrics["nstep"] += 1
-        buf = np.zeros(6)
-        for c in range(d.ncon):
-            con = d.contact[c]
-            g1, g2 = int(con.geom1), int(con.geom2)
-            if ((g1 in pad_g and g2 == bgeom) or (g2 in pad_g and g1 == bgeom)):
-                mujoco.mj_contactForce(model, d, c, buf)
-                metrics["pad_bridge"] = max(metrics["pad_bridge"],
-                                            float(np.linalg.norm(buf[:3])))
-        if movie and metrics["nstep"] % 200 == 0:
+        if movie and capture and metrics["nstep"] % 100 == 0:
             if renderer["r"] is None:
                 renderer["r"] = mujoco.Renderer(model, height=720, width=1280)
             renderer["r"].update_scene(d, camera=cam)
@@ -676,86 +784,265 @@ def phase2_execution(reacher_j, tilt_deg, out_dir, *, ts=5e-4, movie=True):
     def tcp():
         return d.site_xpos[sid].copy()
 
-    def move_to(pos, quat, speed=0.05, min_steps=100):
+    def move_to(pos, quat, speed=0.05, min_steps=100, iters=200):
         q0 = np.array(d.ctrl[:7])
         scr.qpos[:] = d.qpos
-        qg, _, _ = dls_ik(model, scr, pos, quat)
+        qg, _, _ = dls_ik(model, scr, pos, quat, iters=iters)
         n = max(min_steps, int(round(float(np.linalg.norm(np.asarray(pos) - tcp()))
                                      / speed / ts)))
         for t in range(n):
             a = (t + 1) / n
             d.ctrl[:7] = q0 + a * (qg - q0)
             step()
+        return qg
 
     def grip(c, t):
         d.ctrl[grip_aid] = c
         for _ in range(max(1, int(round(t / ts)))):
             step()
 
+    def contact_force(ga, gb):
+        buf = np.zeros(6)
+        tot = np.zeros(3)
+        for c in range(d.ncon):
+            con = d.contact[c]
+            g1, g2 = int(con.geom1), int(con.geom2)
+            if (g1 == ga and g2 == gb) or (g2 == ga and g1 == gb):
+                mujoco.mj_contactForce(model, d, c, buf)
+                tot += con.frame.reshape(3, 3).T @ buf[:3]
+        return tot
+
+    def min_gap(geoms):
+        g = 1.0
+        for gi in geoms:
+            dist = mujoco.mj_geomDistance(model, d, gi, bgeom, 1.0, None)
+            g = min(g, float(dist))
+        return g
+
+    # -- three drops (base, counterweight on prop, bridge) ------------------
+    drops = []
+
+    def drop_block(i, seat_tol=1.5e-3):
+        stage = np.array([stage_x[i], stage_y, 0.5 * S])
+        target = tgt[i]
+        bidi = cube_bid[i]
+        move_to(stage + [0, 0, 0.12], _tilt_grasp_quat(0.0), speed=0.12)
+        grip(GRIPPER_OPEN, 0.2)
+        move_to(stage, _tilt_grasp_quat(0.0), speed=0.03)
+        grip(GRIPPER_CLOSE, 0.6)
+        move_to(stage + [0, 0, 0.12], _tilt_grasp_quat(0.0), speed=0.05)
+        grasped_i = bool(d.xpos[bidi][2] - stage[2] > 0.03)
+        # Transport high, then a closed-loop seat: measure the carried offset and
+        # correct so the CUBE, not the TCP, arrives above the target.
+        move_to([stage[0], stage_y, 0.34], _tilt_grasp_quat(0.0), speed=0.12)
+        move_to([target[0], stage_y, 0.34], _tilt_grasp_quat(0.0), speed=0.12)
+        move_to([target[0], target[1], 0.34], _tilt_grasp_quat(0.0), speed=0.10)
+        for _ in range(2):
+            off = d.xpos[bidi] - tcp()
+            move_to(target + [0, 0, 0.02] - off, _tilt_grasp_quat(0.0),
+                    speed=0.03, min_steps=300)
+        off = d.xpos[bidi] - tcp()
+        move_to(target + [0, 0, 0.001] - off, _tilt_grasp_quat(0.0),
+                speed=0.02, min_steps=300)
+        for _ in range(int(round(0.3 / ts))):
+            step()
+        grip(GRIPPER_OPEN, 0.4)
+        move_to(d.xpos[bidi] + [0, 0, 0.12], _tilt_grasp_quat(0.0), speed=0.05)
+        for _ in range(int(round(0.4 / ts))):
+            step()
+        err = float(np.linalg.norm(d.xpos[bidi] - target))
+        drops.append(dict(block=info.cube_names[i], grasped=grasped_i,
+                          seat_err_mm=err * 1000.0, seated=bool(err < seat_tol)))
+
+    if do_drops:
+        drop_block(0)          # base, prop-free
+        drop_block(2)          # counterweight, caught by its prop
+        drop_block(3)          # bridge, onto the propped counterweight
+    else:
+        # Teleport the pre-stack to certified poses, props retracted (prop-free,
+        # phase-1 protocol) so the arm ride-under is compared apples to apples.
+        _set_free(model, d, "cube0", tgt[0], [1, 0, 0, 0])
+        _set_free(model, d, "cube2", tgt[2], [1, 0, 0, 0])
+        _set_free(model, d, "cube3", tgt[3], [1, 0, 0, 0])
+        if cw_prop_aid is not None:
+            d.ctrl[cw_prop_aid] = cw_prop_retract
+        mujoco.mj_forward(model, d)
+        for _ in range(int(round(0.3 / ts))):
+            step(capture=False)
+
+    # -- ride-under of the reacher (cube1) ----------------------------------
     thr = np.radians(tilt_deg)
     z_ride = BASE_OFFSET[2] + 2.0 * S + 0.5 * S * (np.cos(thr) + np.sin(thr)) + 0.0005
     z_seat = tgt[1][2]
     x_seat = reacher_j * DX_GRID * S + BASE_OFFSET[0]
     bridge_right = 8.0 / 24.0 * S + BASE_OFFSET[0]
     x_engage = bridge_right + 0.5 * S * (np.cos(thr) + np.sin(thr))
-    x_start = x_seat + 0.60 * S
+    x_start = x_seat + 0.30 * S
+    x_deep = x_seat - float(os.environ.get('RU_OVER', '0.004'))  # thread past seat
     grasp_dx = 0.20 * S
-    stage = info.staging_world[1]
+    r_stage = np.array([stage_x[1], stage_y, 0.5 * S])
 
-    def grasp_world(cx, cz, deg):
-        a = -np.radians(deg)
-        R = np.array([[np.cos(a), 0, np.sin(a)], [0, 1, 0], [-np.sin(a), 0, np.cos(a)]])
-        return np.array([cx, 0.0, cz]) + R @ np.array([grasp_dx, 0.0, 0.0])
-
-    # Pick from staging (offset toward the trailing end).
-    gp = stage + np.array([grasp_dx, 0.0, 0.0])
-    move_to(gp + [0, 0, 0.12], info.grasp_quat, speed=0.1)
+    # Pick flat near the trailing end.
+    gp = r_stage + np.array([grasp_dx, 0.0, 0.0])
+    move_to(gp + [0, 0, 0.12], _tilt_grasp_quat(0.0), speed=0.12)
     grip(GRIPPER_OPEN, 0.2)
-    move_to(gp, info.grasp_quat, speed=0.03)
+    move_to(gp, _tilt_grasp_quat(0.0), speed=0.02)
     grip(GRIPPER_CLOSE, 0.6)
-    move_to(gp + [0, 0, 0.10], info.grasp_quat, speed=0.03)
-    grasped = bool(d.xpos[rid][2] - stage[2] > 0.03)
+    move_to(gp + [0, 0, 0.12], _tilt_grasp_quat(0.0), speed=0.03)
+    grasped = bool(d.xpos[rid][2] - r_stage[2] > 0.03)
 
-    # Carry clear: straight up above the structure, across high, then descend on
-    # the open (+x) side, right of the bridge.
-    move_to([stage[0], stage[1], 0.34], info.grasp_quat, speed=0.1)
-    move_to([x_start, 0.0, 0.34], _tilt_grasp_quat(0.0), speed=0.1)
-    move_to(grasp_world(x_start, z_ride, tilt_deg), _tilt_grasp_quat(tilt_deg), speed=0.03)
-    bridge_after_carry = float(np.linalg.norm(d.xpos[bid] - tgt[3]))
-
-    # Ride-under push: left with a wrist pitch, flattening from engage to seat.
-    N = 40
-    for k in range(N):
-        a = (k + 1) / N
-        x = x_start + a * (x_seat - x_start)
-        f = 0.0 if x >= x_engage else min(1.0, (x_engage - x) / max(1e-9, x_engage - x_seat))
-        deg = (1.0 - f) * tilt_deg
-        z = z_ride + f * (z_seat - z_ride)
-        move_to(grasp_world(x, z, deg), _tilt_grasp_quat(deg), speed=0.02, min_steps=50)
-    for _ in range(int(round(0.4 / ts))):
+    # Carry to the pre-push pose: tilted nose-down, leading corner over the base.
+    move_to([x_start, carry_y, 0.32], _tilt_grasp_quat(0.0), speed=0.12)
+    move_to([_grasp_world(x_start, z_ride + 0.05, tilt_deg, grasp_dx)[0], 0.0, 0.32],
+            _tilt_grasp_quat(tilt_deg), speed=0.12)
+    move_to(_grasp_world(x_start, z_ride, tilt_deg, grasp_dx),
+            _tilt_grasp_quat(tilt_deg), speed=0.02, min_steps=400)
+    for _ in range(int(round(0.3 / ts))):
         step()
-    reach_err = float(np.linalg.norm(d.xpos[rid] - np.array([x_seat, 0.0, z_seat])))
+    bpos0 = d.xpos[bid].copy()
+    bang0 = y_angle(d.xquat[bid])
+    cw0 = d.xpos[cw_bid].copy()
+    base0 = d.xpos[base_bid].copy()
+    q_cw0 = d.xquat[cw_bid].copy()
+    q_base0 = d.xquat[base_bid].copy()
+    bridge_after_carry = float(np.linalg.norm(d.xpos[bid] - bpos0))
 
-    grip(GRIPPER_OPEN, 0.5)
-    move_to([x_seat + 0.06, 0.0, z_seat + 0.12], _tilt_grasp_quat(0.0), speed=0.05)
-    for _ in range(int(round(1.0 / ts))):
+    # Admittance thread. Advance x (gated by push reaction) and lower z (gated by
+    # bridge-lift) while pitching to flat; the bridge presses the reacher flat.
+    peak_push = peak_lift = peak_drag = 0.0
+    max_bdx = max_pivot = 0.0
+    pad_clr = hand_clr = 1.0
+    series = []
+    xcur = x_start
+    zcur = z_ride
+    vx = (x_seat - x_start) / (4.5 / ts)
+    vz = (z_seat - z_ride) / (4.5 / ts)
+    kmax = int(round(6.0 / ts))
+    kk = 0
+    while xcur > x_deep and kk < kmax:
+        kk += 1
+        lift = contact_force(rgeom, bgeom)
+        drag = contact_force(rgeom, basegeom)
+        push_r = abs(drag[0]) + abs(lift[0])
+        pry = abs(lift[2])
+        xcur = max(x_deep, xcur + (vx if push_r <= max_push else -abs(vx) * 6.0))
+        zcur = max(z_seat + Z_END_MARGIN,
+                   zcur + (vz if pry <= lift_cap else -abs(vz) * 6.0))
+        f = (0.0 if xcur >= x_engage
+             else min(1.0, (x_engage - xcur) / max(1e-9, x_engage - x_seat)))
+        deg = tilt_deg * (1.0 - f)
+        scr.qpos[:] = d.qpos
+        qg, _, _ = dls_ik(model, scr, _grasp_world(xcur, zcur, deg, grasp_dx),
+                          _tilt_grasp_quat(deg), iters=40)
+        d.ctrl[:7] = qg
+        step()
+        peak_push = max(peak_push, push_r)
+        peak_lift = max(peak_lift, pry)
+        peak_drag = max(peak_drag, abs(drag[0]))
+        bdx = abs(d.xpos[bid][0] - bpos0[0])
+        max_bdx = max(max_bdx, bdx)
+        max_pivot = max(max_pivot, -(y_angle(d.xquat[bid]) - bang0))
+        pad_clr = min(pad_clr, min_gap(pad_g))
+        hand_clr = min(hand_clr, min_gap(hand_g))
+        if kk % 40 == 0:
+            series.append(dict(
+                t=round(float(d.time), 3), reacher_x=float(d.xpos[rid][0]),
+                reacher_tilt_deg=float(np.degrees(y_angle(d.xquat[rid]))),
+                push_N=round(push_r, 4), lift_N=round(float(lift[2]), 4),
+                bridge_dx_mm=round(bdx * 1000.0, 3),
+                pad_clr_mm=round(min_gap(pad_g) * 1000.0, 2)))
+
+    # Hold at the seat so the bridge weight settles onto the reacher before release.
+    for _ in range(int(round(0.4 / ts))):
+        lift = contact_force(rgeom, bgeom)
+        step()
+        peak_lift = max(peak_lift, abs(lift[2]))
+        max_bdx = max(max_bdx, abs(d.xpos[bid][0] - bpos0[0]))
+
+    reach_err = float(np.linalg.norm(d.xpos[rid] - np.array([x_seat, 0.0, z_seat])))
+    reach_tilt = float(np.degrees(y_angle(d.xquat[rid])))
+
+    # Dwell, open the grip, dwell again so the fingers clear before retracting.
+    for _ in range(int(round(0.3 / ts))):
+        step()
+    grip(GRIPPER_OPEN, 0.1)
+    for _ in range(int(round(0.5 / ts))):
+        step()
+    reacher_tilt_open = float(np.degrees(y_angle(d.xquat[rid])))
+    move_to([x_seat + 0.03, carry_y * 0.5, z_ride + 0.12],
+            _tilt_grasp_quat(0.0), speed=0.06)
+
+    # Retract the counterweight prop (it carries the finished clamp's zero load).
+    cw_load0 = 0.0
+    if cw_prop_aid is not None:
+        cw_cube_geom = model.geom("cube2_geom").id
+        cw_load0 = float(np.linalg.norm(contact_force(cw_prop_geom, cw_cube_geom)))
+        n_ramp = int(round(1.5 / ts))
+        for t in range(n_ramp):
+            d.ctrl[cw_prop_aid] = cw_prop_retract * (t + 1) / n_ramp
+            step()
+    for _ in range(int(round(1.2 / ts))):
         step()
 
     if renderer["r"] is not None:
         renderer["r"].close()
-    bridge_return = float(np.linalg.norm(d.xpos[bid] - tgt[3]))
-    ballast_drop = max(float(tgt[0][2] - d.xpos[base_bid][2]),
-                       float(tgt[2][2] - d.xpos[cw_bid][2]))
+
+    # Disturbance and clamp geometry.
+    bridge_dx = float(d.xpos[bid][0] - bpos0[0])
+    bridge_return = float(np.linalg.norm(d.xpos[bid] - bpos0))
+    ballast_disp = max(float(np.linalg.norm(d.xpos[cw_bid] - cw0)),
+                       float(np.linalg.norm(d.xpos[base_bid] - base0)))
+    ballast_rot = max(_ang(q_cw0, d.xquat[cw_bid]), _ang(q_base0, d.xquat[base_bid]))
+    overlap = (float(d.xpos[bid][0]) + 0.5 * S) - (float(d.xpos[rid][0]) - 0.5 * S)
+
+    # Stiff-contact settle verdict on the extracted poses (host oracle, as phase 1).
+    settled = [pedestal()] + [
+        Box(np.array([0.5 * S, 0.5 * S, 0.5 * S]),
+            np.asarray(d.xpos[b]).copy(), np.asarray(d.xquat[b]).copy(), DENSITY)
+        for b in (base_bid, cw_bid, bid, rid)]
+    v2 = settle_test(settled, MU, duration=2.0, solref=STIFF_SOLREF)
+    v6 = settle_test(settled, MU, duration=6.0, solref=STIFF_SOLREF)
+    try:
+        boxes2d = [box2d_from_box(b) for b in settled]
+        st, mg, _ = certify_p4(boxes2d)
+    except Exception:  # noqa: BLE001
+        st, mg = None, None
+
+    seated = bool(reach_err < 3.0e-3 and abs(reach_tilt) < 5.0)
+    clamp_intact = bool(overlap > 0.5e-3 and bridge_return < 8.0e-3
+                        and np.degrees(ballast_rot) < 5.0)
+    if seated and clamp_intact and v6["verdict"] == "stable":
+        outcome = "slip_under_stands"
+    elif seated and clamp_intact:
+        outcome = "seated_settle_marginal"
+    elif np.degrees(ballast_rot) >= 5.0 or bridge_return >= 8.0e-3:
+        outcome = "topple"
+    else:
+        outcome = "catch"
+
     mv = (_encode_frames(frames, out_dir, f"rideunder_franka_{reacher_j}", gif=False)
           if movie else None)
     return dict(
-        reacher_j=reacher_j, tilt_deg=tilt_deg, grasped=grasped,
+        reacher_j=reacher_j, tilt_deg=tilt_deg, cap_x=cap_x, grasped=grasped,
+        drops=drops,
         bridge_after_carry_mm=bridge_after_carry * 1000.0,
-        reach_err_mm=reach_err * 1000.0,
-        bridge_return_mm=bridge_return * 1000.0,
-        ballast_drop_mm=ballast_drop * 1000.0,
-        pad_bridge_contact_N=metrics["pad_bridge"],
-        movie=mv,
+        reach_err_mm=reach_err * 1000.0, reach_tilt_deg=reach_tilt,
+        reacher_tilt_after_open_deg=reacher_tilt_open,
+        peak_push_N=peak_push, peak_push_rw=peak_push / rw,
+        peak_lift_N=peak_lift, peak_drag_N=peak_drag,
+        reacher_weight_N=rw, push_cap_N=max_push, lift_cap_N=lift_cap,
+        max_bridge_dx_mm=max_bdx * 1000.0, max_pivot_deg=float(np.degrees(max_pivot)),
+        bridge_dx_mm=bridge_dx * 1000.0, bridge_return_mm=bridge_return * 1000.0,
+        overlap_mm=overlap * 1000.0,
+        ballast_disp_mm=ballast_disp * 1000.0,
+        ballast_rot_deg=float(np.degrees(ballast_rot)),
+        pad_clearance_mm=pad_clr * 1000.0, hand_clearance_mm=hand_clr * 1000.0,
+        cw_prop_load_before_retract_N=cw_load0,
+        seated=seated, clamp_intact=clamp_intact, outcome=outcome,
+        settle_verdict_2s=v2["verdict"], settle_rot_2s=v2["max_rot"],
+        settle_verdict_6s=v6["verdict"], settle_rot_6s=v6["max_rot"],
+        seated_p4_status=st, seated_p4_margin=mg,
+        series=series, movie=mv,
     )
 
 
@@ -906,27 +1193,47 @@ def main():
     print(f"  {movie}")
 
     print()
-    print("=== phase 2: Franka execution ===")
+    print("=== phase 2: Franka admittance ride-under (side and end bases) ===")
     clr = phase2_clearance()
     print("  finger-grasp clearance (geometric, mm):")
     for name, r in clr.items():
         print(f"    {name}: {r}")
-    phase2 = {"clearance": clr, "execution": None}
-    if not args.no_phase2:
+    phase2 = {"clearance": clr, "executions": {}}
+
+    def _run(label, rj, approach, do_drops, want_movie):
         try:
-            ex = phase2_execution(DESIGNS["clamp_26_24"]["reacher_j"], 6.0, args.out,
-                                  movie=not args.no_movie)
-            phase2["execution"] = ex
-            print(f"  Franka push (clamp_26_24): grasped={ex['grasped']} "
-                  f"bridge_after_carry={ex['bridge_after_carry_mm']:.1f}mm "
-                  f"reach={ex['reach_err_mm']:.1f}mm "
-                  f"pad_bridge_contact={ex['pad_bridge_contact_N']:.3f}N "
-                  f"bridge_return={ex['bridge_return_mm']:.1f}mm "
-                  f"ballast_drop={ex['ballast_drop_mm']:.1f}mm")
-            print(f"  movie: {ex['movie']}")
+            ex = phase2_execution(rj, best_tilt, 4.0, args.out,
+                                  movie=(want_movie and not args.no_movie),
+                                  do_drops=do_drops, approach=approach)
         except Exception as e:  # noqa: BLE001
-            phase2["execution"] = {"error": f"{type(e).__name__}: {e}"}
-            print(f"  phase 2 execution skipped ({type(e).__name__}: {e})")
+            phase2["executions"][label] = {"error": f"{type(e).__name__}: {e}"}
+            print(f"  {label} skipped ({type(e).__name__}: {e})")
+            return
+        phase2["executions"][label] = ex
+        dstr = (" ".join(f"{dd['block']}={dd['seat_err_mm']:.1f}"
+                         for dd in ex["drops"]) or "teleported")
+        print(f"  {label}: outcome={ex['outcome']} "
+              f"reach={ex['reach_err_mm']:.2f}mm tilt={ex['reach_tilt_deg']:.1f}deg "
+              f"drops[{dstr}]")
+        print(f"    push peak={ex['peak_push_N']:.2f}N ({ex['peak_push_rw']:.2f}rw, "
+              f"cap {ex['push_cap_N']:.1f}N) lift peak={ex['peak_lift_N']:.2f}N | "
+              f"bridge max_dx={ex['max_bridge_dx_mm']:.1f}mm return={ex['bridge_return_mm']:.1f}mm "
+              f"ballast={ex['ballast_disp_mm']:.1f}mm/{ex['ballast_rot_deg']:.2f}deg overlap={ex['overlap_mm']:.1f}mm")
+        print(f"    pad_clr={ex['pad_clearance_mm']:.1f}mm hand_clr={ex['hand_clearance_mm']:.1f}mm "
+              f"cw_prop_load={ex['cw_prop_load_before_retract_N']:.3f}N | "
+              f"settle 2s={ex['settle_verdict_2s']}({ex['settle_rot_2s']:.4f}) "
+              f"6s={ex['settle_verdict_6s']}({ex['settle_rot_6s']:.4f}) movie={ex['movie']}")
+
+    if not args.no_phase2:
+        r26 = DESIGNS["clamp_26_24"]["reacher_j"]
+        r29 = DESIGNS["clamp_29_24"]["reacher_j"]
+        # Base comparison on the reacher push, pre-stack teleported (phase-1 protocol).
+        _run("end_26_24_teleport", r26, "end", False, False)
+        _run("side_26_24_teleport", r26, "side", False, True)
+        # Full one-handed build with arm drops (side base).
+        _run("side_26_24_drops", r26, "side", True, False)
+        # 29/24 for the record.
+        _run("side_29_24_teleport", r29, "side", False, False)
 
     out = {
         "meta": {
