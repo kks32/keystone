@@ -3,6 +3,18 @@
 Recorded gaps and sharp edges. Each entry states the limit, the impact, and the
 planned resolution. Dates are when the entry was recorded.
 
+## Prefix feasibility does not model placement kinematics (2026-07-15)
+
+Sequence feasibility certifies each intermediate block SET as a static
+equilibrium. The motion between configurations is not checked: a block may be
+"placed" into a pocket that a physical manipulator could only reach by sliding
+in from the side, or not at all. This became load-bearing with the certified
+n=4 clamp design (overhang 1.25), whose final cube slides in under an existing
+bridge. Impact: discovered sequences are statically buildable but may need a
+placement path check before robotic execution. Resolution: a reachability or
+sweep-collision check per placement (out of scope for the solver; belongs to
+the search layer or the robot planner).
+
 ## Two L definitions (2026-07-15, updated 2026-07-15)
 
 Interface detection scales tolerances by the bounding-box diagonal of all block
