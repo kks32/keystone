@@ -317,3 +317,52 @@ build involved), and backing the reacher off two grid steps (29/24) gives a
 falsework build that stands. The practical ladder at n=4, dx=1/24 is
 therefore: statically certified 31/24, falsework-buildable-and-standing 29/24,
 clear-space (drop) 1. Numbers: out/mujoco/mujoco_falsework.json.
+
+Update, tilt negative control: tilting the reacher on approach does not open the
+zero-clearance slot, as the geometry demands. examples/mujoco_insert.py adds a
+`tilt_deg` mode to the compliant slide. At size_tol = 0 (nominal geometry) the
+clamp reacher never seats: straight (0 deg) collapses the structure (peak contact
+9.2e5 N), 2 deg collapses it (8.8e5 N), 5 deg wedges so hard it stalls 3 cm short
+without toppling (7.5e5 N). No tilt reaches the target. A tilted unit square spans
+cos(theta) + sin(theta) > 1 vertically, so a tilt can only make a one-block slot
+tighter. Numbers: out/mujoco/mujoco_insert.json (tilt_control).
+
+Update, hold-and-shim: split insertion from statics. Replace the reacher with a
+short reacher of height 1 - eps plus a shim plate of thickness eps that fills the
+gap above the reacher's tail. examples/mujoco_shim.py. The final state is all
+boxes, so keystone certifies it exactly; the split certifies feasible for eps in
+{0.01, 0.02, 0.04} and both shim footprints (full plate, tail plate), full
+footprint carrying the better margin (about 1.8e-11 to 3.3e-11 across designs; the
+full plate reproduces the reacher's mass and center of mass exactly). The short
+reacher alone is infeasible (gap margins 2.6e-3 to 7.7e-3): the eps gap above the
+reacher un-certifies the clamp, which is why the shim exists.
+
+Two findings. First, hold-and-shim solves the insertion. The short held reacher
+slides into the one-block slot with eps clearance and seats to 0.6 mm with the
+placed structure undisturbed (0.0001 L), and the shim seats to 0.02 to 0.16 mm
+under a drive that peaks near one block weight, where the monolithic reacher
+jammed at about 700x block weight (Route A). A held block need not stand, so the
+insertion is decoupled from the statics.
+
+Second, the shim seam is a slip and compliance path that lowers the clamp's
+dynamic margin, and it compounds with a deep-thread insertion barrier, so the
+buildable-and-standing overhang backs off below the monolith. The split at exact
+poses topples where the monolith merely crept: at solref 0.002 the clamp split
+first stands (6 s) at 25/24 and the n6 split at 7/6, below the monolith's
+falsework-standing 29/24 and 4/3. But standing needs the reacher backed off, which
+threads it deeper under the bridge, and the cantilevered reacher rams the bridge on
+the way in: clamp 25/24 (thread 7/24) flips the bridge 90 deg and shoves the
+structure 0.38 L, while clamp 31/24 (thread 1/24) and 26/24 (thread 6/24) insert
+cleanly. The n6 4/3 base cube is a knife-edge on the pedestal rim that the reacher
+slide tips, so the n6 reacher stalls 38 mm short. The narrow window that both
+inserts and stands is clamp 26/24 at eps = 0.02: it builds end to end (reacher
+0.6 mm, shim 0.16 mm, shim push about one block weight) and stands (rotation 0.007
+at 2 s and 6 s, solref 0.002). At eps = 0.01 the same build creep-topples (the
+build disturbance tips the near-zero-margin split) and at eps = 0.04 the thicker
+shim seats 4.7 mm off, so the working window is one eps wide. Verdict: hold-and-
+shim makes a backed-off clamp buildable and standing without falsework (26/24 at
+n=4, dx=1/24), one grid step below the falsework value and five below the
+statically certified optimum; the full 31/24 optimum inserts cleanly but its split
+creep-topples. The insertion blocker is removed; the shim seam pays for it in
+overhang. Numbers and the standing-threshold scan: out/mujoco/mujoco_shim.json;
+build movie out/mujoco/shim_movie_clamp_26_24_eps0.02.gif.

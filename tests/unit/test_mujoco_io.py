@@ -9,13 +9,21 @@ import pytest
 
 mujoco = pytest.importorskip("mujoco")
 
-from keystone import Box, box_2d
+from keystone import (
+    Box,
+    Tolerances,
+    assemble,
+    box_2d,
+    build_assembly,
+    solve_p0,
+)
 from keystone.interop import (
     capped_impedance_wrench,
     from_mjcf,
     orientation_error,
     restacked_cubes,
     settle_test,
+    split_reacher,
     to_mjcf,
 )
 
@@ -209,6 +217,96 @@ def test_compliant_driver_stalls_at_cap_two_block_smoke():
     assert data.xpos[body][0] > 0.95
     # It did press up against the wall rather than hovering at the start.
     assert data.xpos[body][0] < 1.2
+
+
+# --------------------------------------------------------------------------
+# Hold-and-shim split geometry (examples/mujoco_shim.py).
+# --------------------------------------------------------------------------
+
+
+def _pedestal():
+    return box_2d(6.0, 1.0, -3.0, 0.5)
+
+
+def _cube(layer, x):
+    return box_2d(1.0, 1.0, x, 1.5 + layer)
+
+
+def _certify_2d(boxes, mu):
+    tol = Tolerances()
+    system = assemble(build_assembly(boxes, mu=mu, tol=tol, dim=2), tol, cone="linear2d")
+    r = solve_p0(system, tol)
+    return r.status, float(r.margin)
+
+
+def test_split_reacher_full_reproduces_envelope():
+    # The full-footprint split reproduces the reacher's envelope, mass, and
+    # center of mass exactly: the short reacher plus the shim fill the reacher.
+    reacher = box_2d(1.0, 1.0, 19.0 / 24.0, 2.5)
+    eps = 0.03
+    short, shim = split_reacher(reacher, eps, footprint="full")
+    # Short reacher: base fixed, top lowered by eps.
+    assert abs((short.position[2] - short.half_extents[2]) - 2.0) < 1e-12
+    assert abs((short.position[2] + short.half_extents[2]) - (3.0 - eps)) < 1e-12
+    # Shim fills the eps gap up to the reacher's top.
+    assert abs(2.0 * shim.half_extents[2] - eps) < 1e-12
+    assert abs((short.position[2] + short.half_extents[2])
+               - (shim.position[2] - shim.half_extents[2])) < 1e-12
+    assert abs((shim.position[2] + shim.half_extents[2]) - 3.0) < 1e-12
+    # Same x and y footprint as the reacher.
+    for b in (short, shim):
+        assert abs(b.half_extents[0] - reacher.half_extents[0]) < 1e-12
+        assert abs(b.half_extents[1] - reacher.half_extents[1]) < 1e-12
+        assert abs(b.position[0] - reacher.position[0]) < 1e-12
+    # Combined mass and center of mass equal the reacher's.
+    m = short.mass + shim.mass
+    assert abs(m - reacher.mass) < 1e-9 * reacher.mass
+    com_z = (short.mass * short.position[2] + shim.mass * shim.position[2]) / m
+    assert abs(com_z - reacher.position[2]) < 1e-12
+
+
+def test_split_reacher_tail_spans_clamp_interval():
+    # The tail footprint spans exactly the given clamp overlap in x, at the same
+    # thickness and top as the full shim.
+    reacher = box_2d(1.0, 1.0, 19.0 / 24.0, 2.5)
+    tail_x = (7.0 / 24.0, 8.0 / 24.0)
+    short, shim = split_reacher(reacher, 0.02, footprint="tail", tail_x=tail_x)
+    assert abs((shim.position[0] - shim.half_extents[0]) - tail_x[0]) < 1e-12
+    assert abs((shim.position[0] + shim.half_extents[0]) - tail_x[1]) < 1e-12
+    assert abs((shim.position[2] + shim.half_extents[2]) - 3.0) < 1e-12
+
+
+def test_split_reacher_rejects_bad_input():
+    reacher = box_2d(1.0, 1.0, 0.0, 2.5)
+    with pytest.raises(ValueError, match="eps"):
+        split_reacher(reacher, 0.0, footprint="full")
+    with pytest.raises(ValueError, match="eps"):
+        split_reacher(reacher, 1.0, footprint="full")  # >= full height
+    with pytest.raises(ValueError, match="tail_x"):
+        split_reacher(reacher, 0.02, footprint="tail")
+    tilted = box_2d(1.0, 1.0, 0.0, 2.5, angle_y=0.1)
+    with pytest.raises(ValueError, match="axis-aligned"):
+        split_reacher(tilted, 0.02, footprint="full")
+
+
+def test_split_state_certifies_feasible():
+    # The clamp 31/24 optimum with its reacher split into a short reacher plus a
+    # shim certifies feasible for at least one eps, and the short reacher alone
+    # (the eps gap left under the bridge) does not: that gap is why the shim
+    # exists. dx = 1/24, cells base, counterweight, bridge, reacher.
+    dx = 1.0 / 24.0
+    pre = [_pedestal(), _cube(0, -2 * dx), _cube(1, -14 * dx), _cube(2, -4 * dx)]
+    reacher = _cube(1, 19 * dx)
+    feasible_eps = []
+    for eps in (0.01, 0.02, 0.04):
+        short, shim = split_reacher(reacher, eps, footprint="full")
+        status, _margin = _certify_2d(pre + [short, shim], 0.7)
+        if status == "feasible":
+            feasible_eps.append(eps)
+        # The short reacher alone leaves an eps gap under the bridge: infeasible.
+        gap_status, _ = _certify_2d(pre + [short], 0.7)
+        assert gap_status == "infeasible", (eps, gap_status)
+    assert feasible_eps, "no eps gave a feasible split state"
 
 
 if __name__ == "__main__":

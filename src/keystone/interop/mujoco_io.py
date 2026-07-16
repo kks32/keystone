@@ -113,6 +113,75 @@ def restacked_cubes(
     return out
 
 
+def split_reacher(
+    reacher: Box,
+    eps: float,
+    *,
+    footprint: str = "full",
+    tail_x: tuple[float, float] | None = None,
+) -> tuple[Box, Box]:
+    """Split a monolithic reacher into a short reacher plus a thin shim plate.
+
+    The hold-and-shim build model (examples/mujoco_shim.py). A reacher that must
+    enter a one-block-high slot under a clamping bridge cannot slide in at zero
+    clearance. Splitting it decouples insertion from statics: a short reacher of
+    height `2 * hz - eps` slides in with `eps` vertical clearance while held, then
+    a shim of thickness `eps` fills the gap above its tail so the final all-box
+    state reproduces the clamp.
+
+    The reacher must be an axis-aligned box (identity orientation). The short
+    reacher keeps the reacher's base and footprint with its top lowered by `eps`.
+    The shim sits on the short reacher's top, filling up to the reacher's original
+    top.
+
+    footprint "full": the shim spans the reacher's full x extent. The short
+        reacher and full shim together reproduce the reacher's envelope, mass, and
+        center of mass exactly.
+    footprint "tail": the shim spans `tail_x = (x_lo, x_hi)` only, the x interval
+        where the clamping block overlaps the reacher. A smaller, lighter plate.
+
+    Returns (short_reacher, shim), both Box. Degrades to 2D through the shared Box
+    structure: the split axis is world z, the vertical in the xz plane.
+    """
+    q = np.asarray(reacher.quat, dtype=np.float64)
+    if not np.isclose(abs(q[0]), 1.0, atol=1e-9):
+        raise ValueError("split_reacher expects an axis-aligned (identity) reacher")
+    hx, hy, hz = (float(v) for v in reacher.half_extents)
+    if not 0.0 < eps < 2.0 * hz:
+        raise ValueError(f"eps must be in (0, {2.0 * hz}), got {eps}")
+    cx, cy, cz = (float(v) for v in reacher.position)
+    bottom = cz - hz
+    top = cz + hz
+    short = Box(
+        np.array([hx, hy, hz - eps / 2.0]),
+        np.array([cx, cy, bottom + (hz - eps / 2.0)]),
+        reacher.quat.copy(),
+        reacher.density,
+    )
+    if footprint == "full":
+        shim = Box(
+            np.array([hx, hy, eps / 2.0]),
+            np.array([cx, cy, top - eps / 2.0]),
+            reacher.quat.copy(),
+            reacher.density,
+        )
+    elif footprint == "tail":
+        if tail_x is None:
+            raise ValueError("footprint='tail' needs tail_x=(x_lo, x_hi)")
+        lo, hi = float(tail_x[0]), float(tail_x[1])
+        if not hi > lo:
+            raise ValueError(f"tail_x must satisfy x_hi > x_lo, got {tail_x}")
+        shim = Box(
+            np.array([(hi - lo) / 2.0, hy, eps / 2.0]),
+            np.array([(lo + hi) / 2.0, cy, top - eps / 2.0]),
+            reacher.quat.copy(),
+            reacher.density,
+        )
+    else:
+        raise ValueError(f"footprint must be 'full' or 'tail', got {footprint!r}")
+    return short, shim
+
+
 def to_mjcf(
     boxes: Sequence[Box],
     mu: float,

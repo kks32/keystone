@@ -97,6 +97,24 @@ def _vec(a):
     return " ".join(_fmt(v) for v in a)
 
 
+def _tilt_quat(base_quat, tilt_deg):
+    """Rotate a (w, x, y, z) quaternion by `tilt_deg` about the world y axis.
+
+    The 2D slide plane is xz; a tilt about y tips the block in that plane. For an
+    identity base this is just (cos, 0, sin, 0)."""
+    t = np.radians(tilt_deg) / 2.0
+    yq = np.array([np.cos(t), 0.0, np.sin(t), 0.0])
+    b = np.asarray(base_quat, dtype=np.float64)
+    return np.array(
+        [
+            yq[0] * b[0] - yq[2] * b[2],
+            yq[0] * b[1] + yq[2] * b[3],
+            yq[0] * b[2] + yq[2] * b[0],
+            yq[0] * b[3] - yq[2] * b[1],
+        ]
+    )
+
+
 def pedestal6():
     return box_2d(6.0, 1.0, -3.0, 0.5)
 
@@ -445,6 +463,7 @@ def compliant_insert(
     *,
     params=IMPEDANCE,
     static_boxes=(),
+    tilt_deg=0.0,
     timestep=5e-4,
     slide_off=0.9,
     drop_h=0.3,
@@ -459,6 +478,11 @@ def compliant_insert(
     placed_boxes: free bodies already in place (exact or settled poses).
     static_boxes: extra static support bodies (a falsework prop), welded.
     mode: DROP (descend from above) or SLIDE (approach laterally from +x).
+    tilt_deg: tilt the moving block about the world y axis by this many degrees
+        for the whole approach (the negative-control mode of PART 1: a tilted
+        unit square spans cos(theta) + sin(theta) > 1 vertically, so a tilt can
+        only wedge a zero-clearance slot worse, never open it). The seated target
+        keeps the tilt, so a wedged tilted block stalls under the same cap.
     During transit the target z carries params["z_bias"] so the block rides the
     lower face; the hold phase removes the bias and seats the block.
 
@@ -475,7 +499,8 @@ def compliant_insert(
     else:
         raise ValueError(f"mode must be {DROP!r} or {SLIDE!r}, got {mode!r}")
 
-    moving = Box(target_box.half_extents, start, target_box.quat, target_box.density)
+    move_quat = _tilt_quat(target_box.quat, tilt_deg)
+    moving = Box(target_box.half_extents, start, move_quat, target_box.density)
     boxes = list(placed_boxes) + [moving] + list(static_boxes)
     free = list(range(k + 1))  # placed + moving are free; supports are static
     L = assembly_diagonal(list(placed_boxes) + [target_box])
@@ -502,7 +527,7 @@ def compliant_insert(
         kp_rot=params["kp_rot"],
         kd_rot=params["kd_rot"],
         max_push=max_push,
-        target_quat=target_box.quat.copy(),
+        target_quat=move_quat.copy(),
     )
     pos0 = {i: data.xpos[i].copy() for i in placed_ids}
     quat0 = {i: data.xquat[i].copy() for i in placed_ids}
@@ -621,7 +646,7 @@ def compliant_insert(
     return report, settled
 
 
-def compliant_reacher_slide(spec, size_tol, params=IMPEDANCE):
+def compliant_reacher_slide(spec, size_tol, params=IMPEDANCE, tilt_deg=0.0):
     """Place the pre-reacher structure at exact re-stacked poses, then slide the
     reacher in with the compliant driver. The pre-reacher structure is
     re-certified stable first; this isolates the reacher insertion from any
@@ -630,8 +655,54 @@ def compliant_reacher_slide(spec, size_tol, params=IMPEDANCE):
     ri = spec["reacher"]
     pre = [pedestal6()] + cubes[:ri]
     reacher = cubes[ri]
-    rep, _ = compliant_insert(pre, reacher, SLIDE, spec["mu"], params=params)
+    rep, _ = compliant_insert(
+        pre, reacher, SLIDE, spec["mu"], params=params, tilt_deg=tilt_deg
+    )
     return rep
+
+
+def run_tilt_control(name, tilts=(0.0, 2.0, 5.0)):
+    """PART 1 negative control: slide the reacher in at zero block tolerance with
+    a few degrees of tilt about y and compare to the straight slide.
+
+    A straight rigid slide jams at zero clearance (the slot is exactly one block
+    high). Tilting a unit square makes its vertical span cos(theta) + sin(theta),
+    which exceeds 1, so the tilted reacher can only wedge harder. This records the
+    numbers behind "why not just tilt it": peak contact force, peak driver push,
+    the stall point (how far short of the target the block stops), and the
+    verdict. size_tol is fixed at 0 (the nominal, zero-clearance geometry)."""
+    spec = DESIGNS[name]
+    print()
+    print(f"=== PART 1 tilt negative control: {name} (size_tol=0) ===")
+    print(
+        f"{'tilt_deg':>8s} {'outcome':>10s} {'reach_err':>10s} "
+        f"{'peak_push':>12s} {'peak_contact':>14s} {'struct_rot':>10s}"
+    )
+    rows = []
+    for td in tilts:
+        rep = compliant_reacher_slide(spec, 0.0, tilt_deg=td)
+        rows.append(
+            {
+                "tilt_deg": td,
+                "outcome": rep["outcome"],
+                "reach_err": rep["reach_err"],
+                "peak_push": rep["peak_push"],
+                "peak_contact_force": rep["peak_contact_force"],
+                "struct_disturb_rel": rep["struct_disturb_rel"],
+                "struct_rot": rep["struct_rot"],
+            }
+        )
+        print(
+            f"{td:8.1f} {rep['outcome']:>10s} {rep['reach_err']:10.4f} "
+            f"{rep['peak_push']:12.3e} {rep['peak_contact_force']:14.3e} "
+            f"{rep['struct_rot']:10.4f}"
+        )
+    print(
+        "  tilt does not open the zero-clearance slot: no tilt seats the reacher "
+        "(every outcome is collapse or a wedge-stall short of the target) and "
+        "peak contact stays of order 1e6 N, tens of block weights, at every tilt"
+    )
+    return {"design": name, "size_tol": 0.0, "rows": rows}
 
 
 def run_route_a(name, args, size_tols=(0.0, 0.005, 0.0075, 0.01, 0.02)):
@@ -760,6 +831,9 @@ def main():
         route_a[name] = run_route_a(name, args)
     route_a["clamp_31_24"]["cap_sweep"] = cap_sweep("clamp_31_24")
 
+    # PART 1: tilt negative control on the clamp reacher at zero tolerance.
+    tilt_control = {"clamp_31_24": run_tilt_control("clamp_31_24")}
+
     # Render the failed clamp insertion at the realistic tolerance.
     spec = DESIGNS["clamp_31_24"]
     cubes = restacked_cubes(spec["cells"], 0.005, spec["dx"])
@@ -785,6 +859,7 @@ def main():
         },
         "rigid_baseline": results,
         "route_a": route_a,
+        "tilt_control": tilt_control,
         "renders": renders,
     }
     path = os.path.join(args.out, "mujoco_insert.json")

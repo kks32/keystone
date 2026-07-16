@@ -20,6 +20,7 @@ from .mujoco_io import (
     orientation_error,
     restacked_cubes,
     settle_test,
+    split_reacher,
     to_mjcf,
 )
 
@@ -31,5 +32,6 @@ __all__ = [
     "orientation_error",
     "restacked_cubes",
     "settle_test",
+    "split_reacher",
     "to_mjcf",
 ]
