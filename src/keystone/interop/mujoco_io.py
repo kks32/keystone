@@ -243,6 +243,10 @@ def to_mjcf(
     lines: list[str] = []
     lines.append(f'<mujoco model="{model_name}">')
     lines.append(
+        '  <visual><global offwidth="1920" offheight="1080"/>'
+        '<quality offsamples="8"/></visual>'
+    )
+    lines.append(
         f'  <option timestep="{_fmt(timestep)}" solver="Newton" '
         f'integrator="implicitfast"/>'
     )

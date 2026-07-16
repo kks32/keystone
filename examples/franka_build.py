@@ -488,7 +488,7 @@ class BuildDriver:
     def snapshot(self, path):
         """Full-resolution render of the current state."""
         mj = self.mujoco
-        r = mj.Renderer(self.model, height=480, width=640)
+        r = mj.Renderer(self.model, height=720, width=1280)
         r.update_scene(self.data, camera=self.cam or self._camera())
         img = np.clip(r.render().astype(np.float32) * 1.4, 0, 255).astype(np.uint8)
         r.close()
@@ -599,6 +599,8 @@ def main():
     ap.add_argument("--timestep", type=float, default=5e-4)
     ap.add_argument("--frame-stride", type=int, default=400,
                     help="capture a movie frame every N steps; 0 disables")
+    ap.add_argument("--frame-h", type=int, default=300, help="movie frame height")
+    ap.add_argument("--frame-w", type=int, default=420, help="movie frame width")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
@@ -615,7 +617,8 @@ def main():
     spec, info = compose_scene(timestep=args.timestep)
     model = spec.compile()
     driver = BuildDriver(model, info, args.timestep,
-                         frame_stride=args.frame_stride)
+                         frame_stride=args.frame_stride,
+                         frame_size=(args.frame_h, args.frame_w))
     reset_home(model, driver.data)
     driver.hold(0.3)
 

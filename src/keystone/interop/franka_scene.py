@@ -255,6 +255,10 @@ def compose_scene(
     spec = mujoco.MjSpec.from_file(PANDA_XML)
     spec.option.timestep = timestep
     spec.option.solver = mujoco.mjtSolver.mjSOL_NEWTON
+    # HD offscreen framebuffer with multisampling for movie rendering.
+    spec.visual.global_.offwidth = 1920
+    spec.visual.global_.offheight = 1080
+    spec.visual.quality.offsamples = 8
     # Elliptic cones with a high impratio: MuJoCo's regularized pyramidal
     # friction lets a pinched cube creep tangentially under gravity (measured
     # 2.0 mm/s at a 23 N pinch, mu 1.0; the cube slid 9 mm down the fingers
