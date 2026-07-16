@@ -92,6 +92,12 @@ CERTIFIED_PLACEMENT = [
     # reached by a four-high staircase instead of two towers of two. The
     # crane price at this grid is 31/24 - 1 = 7/24 of a block width.
     (4, 1.0 / 24.0, "drop", 1.0, [(0, -8), (1, -5), (2, 1), (3, 12)]),
+    # n=4, dx=1/12, slide_clear: optimum 1, equal to drop, same design.
+    # Banning the zero-clearance under-bridge pass (which jams in rigid
+    # body simulation) costs the whole corridor advantage: the executable
+    # slide is worth no more than the crane on this grid. In particular
+    # no slide_clear order reaches the MCTS 7/6 design's overhang.
+    (4, 1.0 / 12.0, "slide_clear", 1.0, [(0, 0), (0, -21), (1, -11), (1, 6)]),
 ]
 
 
@@ -173,7 +179,9 @@ def test_drop_price_at_n4():
     # The headline numbers: crane (drop-only) construction certifiably
     # costs 1/4 block width at n=4 on the 1/12 grid and 7/24 on the 1/24
     # grid; the drop optimum is exactly 1 on both. Slide costs nothing:
-    # the static optimum's build order is slide-reachable.
+    # the static optimum's build order is slide-reachable. The executable
+    # slide (slide_clear) is worth exactly the crane: the certified ladder
+    # at dx=1/12 is static 5/4 = slide 5/4 > slide_clear 1 = drop 1.
     def opt(table, n, dx, placement=None):
         for row in table:
             if placement is None:
@@ -189,6 +197,7 @@ def test_drop_price_at_n4():
     dx12, dx24 = 1.0 / 12.0, 1.0 / 24.0
     assert abs(opt(CERTIFIED, 4, dx12) - 5.0 / 4.0) < 1e-12
     assert abs(opt(CERTIFIED_PLACEMENT, 4, dx12, "slide") - 5.0 / 4.0) < 1e-12
+    assert opt(CERTIFIED_PLACEMENT, 4, dx12, "slide_clear") == 1.0
     assert opt(CERTIFIED_PLACEMENT, 4, dx12, "drop") == 1.0
     assert opt(CERTIFIED_PLACEMENT, 4, dx24, "drop") == 1.0
     price12 = opt(CERTIFIED, 4, dx12) - opt(CERTIFIED_PLACEMENT, 4, dx12, "drop")
@@ -199,15 +208,17 @@ def test_drop_price_at_n4():
 
 def test_static_clamp_final_step_blocked_under_drop():
     # The archived static optima at n=4 end with an under-bridge slide, so
-    # their recorded orders fail the drop re-check exactly at the last step
-    # and pass the slide re-check at every step.
+    # their recorded orders fail the drop and slide_clear re-checks exactly
+    # at the last step and pass the slide re-check at every step.
     for (n, dx, _optimum, sequence) in CERTIFIED:
         if n != 4:
             continue
         ok, flags = bnb.sequence_reachable(n, dx, sequence, "slide")
         assert ok, (n, dx, flags)
-        ok, flags = bnb.sequence_reachable(n, dx, sequence, "drop")
-        assert not ok and flags[:-1] == [True] * (len(sequence) - 1), (n, dx)
+        for mode in ("drop", "slide_clear"):
+            ok, flags = bnb.sequence_reachable(n, dx, sequence, mode)
+            assert not ok, (n, dx, mode)
+            assert flags[:-1] == [True] * (len(sequence) - 1), (n, dx, mode)
 
 
 def test_bnb_static_short_run_matches_prechange_counts():

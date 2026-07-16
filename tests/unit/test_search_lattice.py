@@ -189,10 +189,12 @@ def ref_reach(spec, key, layer, xidx, mode):
                 drop_clear = False
     if mode == "drop":
         return drop_clear
-    # Slide corridors at the target layer only.
-    same = [j * dx for (L, j) in key if L == layer]
-    right_blocked = any(px - x > -1.0 + 0.5 * dx for px in same)
-    left_blocked = any(px - x < 1.0 - 0.5 * dx for px in same)
+    # Slide corridors at the target layer; slide_clear also treats a
+    # layer-(L+1) cube over the sweep as a blocker.
+    layers = (layer,) if mode == "slide" else (layer, layer + 1)
+    block = [j * dx for (L, j) in key if L in layers]
+    right_blocked = any(px - x > -1.0 + 0.5 * dx for px in block)
+    left_blocked = any(px - x < 1.0 - 0.5 * dx for px in block)
     return drop_clear or (not right_blocked) or (not left_blocked)
 
 
@@ -364,10 +366,10 @@ class TestReachability:
             LT.LatticeSpec(n_max=4, mode="teleport")
 
     def test_matches_reference_under_modes(self):
-        # Full legality under drop and slide equals the independent python
+        # Full legality under each mode equals the independent python
         # reference (static rules AND reachability) on random reachable
         # states generated under the same mode.
-        for mode in ("drop", "slide"):
+        for mode in ("drop", "slide", "slide_clear"):
             spec = LT.LatticeSpec(n_max=5, dx=self.DX12, mode=mode)
             keys = random_reachable_states(spec, 40, seed=2)
             cand_L, cand_J = LT.action_grid(spec)
@@ -387,11 +389,12 @@ class TestReachability:
                 assert np.array_equal(legal, ref), (mode, key)
 
     def test_modes_only_remove_actions(self):
-        # drop-legal implies slide-legal implies static-legal, elementwise,
-        # on every tested state. Reachability is a pure restriction.
+        # drop implies slide_clear implies slide implies static, legality
+        # elementwise on every tested state. Reachability is a pure
+        # restriction and the modes are nested.
         specs = {
             m: LT.LatticeSpec(n_max=5, dx=self.DX12, mode=m)
-            for m in ("static", "slide", "drop")
+            for m in ("static", "slide", "slide_clear", "drop")
         }
         keys = random_reachable_states(specs["static"], 40, seed=3)
         cand = LT.action_grid(specs["static"])
@@ -402,15 +405,19 @@ class TestReachability:
                 )[0]
                 for m, s in specs.items()
             }
-            assert not np.any(grids["drop"] & ~grids["slide"]), key
+            assert not np.any(grids["drop"] & ~grids["slide_clear"]), key
+            assert not np.any(grids["slide_clear"] & ~grids["slide"]), key
             assert not np.any(grids["slide"] & ~grids["static"]), key
 
     def test_drop_blocks_under_bridge_clamp(self):
         # The certified static 31/24 clamp at n=4, dx=1/24 ends by sliding
         # the reacher (1, 19) under the layer-2 bridge at (2, -4). That
-        # final placement must be illegal under drop and legal under slide.
+        # final placement must be illegal under drop and slide_clear (the
+        # under-bridge press fit) and legal under slide.
         prefix = [(0, -2), (1, -14), (2, -4)]
-        for mode, want in (("static", True), ("slide", True), ("drop", False)):
+        cases = (("static", True), ("slide", True),
+                 ("slide_clear", False), ("drop", False))
+        for mode, want in cases:
             spec = LT.LatticeSpec(n_max=4, dx=self.DX24, mode=mode)
             st = LT.state_from_placements(spec, prefix)
             assert bool(LT.is_legal(spec, st, 1, 19)) is want, mode
@@ -443,6 +450,19 @@ class TestReachability:
         key = [(0, -30), (0, 0), (1, -24)]  # x = -2.5, 0.0, bridge at -2.0
         for mode, want in (("static", True), ("slide", False), ("drop", False)):
             spec = spec_by_mode[mode]
+            st = LT.state_from_placements(spec, key)
+            assert bool(LT.is_legal(spec, st, 0, -15)) is want, mode
+
+    def test_slide_clear_blocks_corridor_under_bridge(self):
+        # A layer-1 bridge sits over the only open corridor to a layer-0
+        # target and over part of the target itself. slide passes under it
+        # (the bridge is above the slide plane); slide_clear treats the
+        # zero-clearance pass as blocked; drop is blocked by the overlap.
+        key = [(0, -30), (1, -24)]  # x = -2.5 and a bridge at x = -2.0
+        cases = (("static", True), ("slide", True),
+                 ("slide_clear", False), ("drop", False))
+        for mode, want in cases:
+            spec = LT.LatticeSpec(n_max=6, dx=self.DX12, mode=mode)
             st = LT.state_from_placements(spec, key)
             assert bool(LT.is_legal(spec, st, 0, -15)) is want, mode
 

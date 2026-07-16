@@ -18,8 +18,13 @@ Update: the lattice search now offers placement-reachability modes on
 behavior). "drop" requires a clear vertical column above the target cell at
 placement time (a crane or top-grasp build). "slide" accepts a clear column
 or a clear straight lateral corridor at the target layer, entered from either
-side past every placed cube. Reachability is evaluated against the state
-before each placement, so it depends on build order, not just the final set.
+side past every placed cube. "slide_clear" is the executable slide: it also
+forbids corridors that pass under a layer-(L+1) bridge, target cell included,
+because the lattice's exact unit clearance makes that pass a zero-clearance
+press fit (rigid-body simulation of the certified clamp shows the slide-in
+jamming at about 700x block weight and collapsing the structure).
+Reachability is evaluated against the state before each placement, so it
+depends on build order, not just the final set.
 
 What the modes model, and what they do not. Clearances are the exact unit
 gaps of the lattice: a layer-(L+1) bridge clears a layer-L slide by
@@ -30,14 +35,18 @@ side or top room the lattice does not budget for. No swept-volume physics:
 the moving cube is assumed massless in transit and the structure is only
 checked statically before and after.
 
-Certified prices at n=4 (branch and bound,
-tests/analytic/test_bnb_optima.py): slide costs nothing, the 5/4 clamp build
-order is slide-legal at every step. Drop-only pins the optimum at exactly 1
-on both grids: price 1/4 block width against 5/4 static at dx=1/12 (two
-towers of two) and 7/24 against 31/24 at dx=1/24 (a four-high staircase). At
-n=3, dx=1/12 drop is free (5/6 either way). Resolution for real hardware: a
-sweep-collision check with end-effector geometry belongs to the robot
-planner, not this lattice.
+Certified ladder at n=4, dx=1/12 (branch and bound,
+tests/analytic/test_bnb_optima.py): static 5/4 = slide 5/4 > slide_clear 1 =
+drop 1. The idealized slide costs nothing, the 5/4 clamp build order is
+slide-legal at every step, but every step of that value rides on the
+unexecutable under-bridge pass: banning it (slide_clear) collapses the
+optimum to the crane value 1, so no executable-slide order reaches even the
+MCTS 7/6 design. Drop-only pins the optimum at exactly 1 on both grids:
+price 1/4 block width against 5/4 static at dx=1/12 (two towers of two) and
+7/24 against 31/24 at dx=1/24 (a four-high staircase). At n=3, dx=1/12 drop
+is free (5/6 either way). Resolution for real hardware: a sweep-collision
+check with end-effector geometry belongs to the robot planner, not this
+lattice.
 
 ## Two L definitions (2026-07-15, updated 2026-07-15)
 

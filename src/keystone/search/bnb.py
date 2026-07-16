@@ -77,9 +77,10 @@ Placement modes.
 placement selects the reachability rule of lattice.is_legal: "static"
 (no motion check, today's behavior), "drop" (clear vertical column above
 the target), "slide" (drop column or a lateral corridor at the target
-layer). Reachability only removes actions, so every completion under drop
-or slide is also a static completion and the admissible bound below is
-unchanged: it never undercounts what a restricted mode can reach.
+layer), "slide_clear" (slide with under-bridge corridors forbidden).
+Reachability only removes actions, so every completion under a mode is
+also a static completion and the admissible bound below is unchanged: it
+never undercounts what a restricted mode can reach.
 
 Certification.
 

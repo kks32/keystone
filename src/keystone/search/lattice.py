@@ -78,10 +78,12 @@ class LatticeSpec:
 
     mode selects the placement-reachability rule enforced by is_legal:
     "static" (default) checks static-support legality only, "drop"
-    additionally requires a clear vertical column above the target, and
+    additionally requires a clear vertical column above the target,
     "slide" additionally requires either a clear column or a clear lateral
-    corridor at the target layer. mode is a compile-time constant, so the
-    "static" path traces the same graph as before this field existed.
+    corridor at the target layer, and "slide_clear" tightens "slide" by
+    forbidding slides under layer-(L+1) bridges anywhere on the corridor.
+    mode is a compile-time constant, so the "static" path traces the same
+    graph as before this field existed.
     """
 
     n_max: int
@@ -98,9 +100,10 @@ class LatticeSpec:
     ped_cz: float = PED_CZ
 
     def __post_init__(self):
-        if self.mode not in ("static", "drop", "slide"):
+        if self.mode not in ("static", "drop", "slide", "slide_clear"):
             raise ValueError(
-                f"mode must be 'static', 'drop', or 'slide', got {self.mode!r}"
+                "mode must be 'static', 'drop', 'slide', or 'slide_clear', "
+                f"got {self.mode!r}"
             )
 
     @property
@@ -525,6 +528,14 @@ def _reach_ok(spec: LatticeSpec, state: State, layer, xidx):
     width, the interval the cube sweeps from the target out past every
     placed extent on that side.
 
+    Slide_clear: "slide" with the under-bridge pass forbidden. The exact
+    unit clearance of a layer-(L+1) bridge is a zero-clearance press fit;
+    rigid-body simulation of the certified clamp shows the pass jamming
+    and collapsing the structure. Here a corridor is also blocked when
+    any layer-(L+1) cube's interval meets the swept interval, target cell
+    included, with nonzero width. A clear drop column still legalizes the
+    placement, so drop implies slide_clear implies slide.
+
     Modeling assumptions, recorded in KNOWN_LIMITS.md: clearances are the
     exact unit-cell gaps of the lattice, straight-line axis-aligned
     approach motions only, and no gripper or tool clearance is modeled.
@@ -551,6 +562,14 @@ def _reach_ok(spec: LatticeSpec, state: State, layer, xidx):
     d = px - x
     right_blocked = jnp.any(same & (d > -1.0 + 0.5 * dx))
     left_blocked = jnp.any(same & (d < 1.0 - 0.5 * dx))
+    if spec.mode == "slide":
+        return drop_clear | ~right_blocked | ~left_blocked
+
+    # slide_clear: a layer-(L+1) cube over any part of the sweep, target
+    # cell included, also blocks that corridor. Same open-interval test.
+    bridge = msk & (pl == layer + 1)
+    right_blocked |= jnp.any(bridge & (d > -1.0 + 0.5 * dx))
+    left_blocked |= jnp.any(bridge & (d < 1.0 - 0.5 * dx))
     return drop_clear | ~right_blocked | ~left_blocked
 
 
@@ -563,8 +582,9 @@ def is_legal(spec: LatticeSpec, state: State, layer, xidx):
 
     spec.mode adds a placement-reachability conjunct: "drop" requires a
     clear vertical column above the target, "slide" requires the column
-    or a lateral corridor at the target layer (see _reach_ok). The mode
-    is a compile-time constant; "static" (the default) skips the check
+    or a lateral corridor at the target layer, "slide_clear" also forbids
+    corridors under layer-(L+1) bridges (see _reach_ok). The mode is a
+    compile-time constant; "static" (the default) skips the check
     entirely, so the default trace is the pre-mode code path unchanged.
     """
     dx = spec.dx

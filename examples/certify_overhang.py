@@ -7,8 +7,9 @@ re-verified prefix by prefix on the host pipeline before it is emitted.
 
 --placement selects the reachability rule the search enforces per step:
 static (no motion check, the default), drop (clear vertical column above
-the target, a crane or top-grasp build), or slide (drop column or a clear
-lateral corridor at the target layer).
+the target, a crane or top-grasp build), slide (drop column or a clear
+lateral corridor at the target layer), or slide_clear (slide with
+under-bridge corridors forbidden; the executable slide).
 
 Two JSON files are written. --out holds the full record of this run (node
 counts, wall time, the prefix margin trace). The accumulating optima file
@@ -84,7 +85,8 @@ def main():
     parser.add_argument("--n", type=int, default=4, help="number of cubes")
     parser.add_argument("--dx", type=str, default="1/12",
                         help="grid step, float or fraction like 1/12")
-    parser.add_argument("--placement", choices=["static", "slide", "drop"],
+    parser.add_argument("--placement",
+                        choices=["static", "slide", "slide_clear", "drop"],
                         default="static",
                         help="per-step reachability rule enforced by the search")
     parser.add_argument("--time-limit", type=float, default=None,
