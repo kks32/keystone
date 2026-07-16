@@ -16,6 +16,7 @@ Run: python examples/search_overhang_fast.py --n 4 --sims 2000 --batch 16
 """
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -168,6 +169,29 @@ def main():
         print(f"wrote {png}")
     else:
         print("no feasible cube placement found")
+
+    # Machine-readable record of the run: sequence, margins, config.
+    record = {
+        "n": args.n,
+        "dx": args.dx,
+        "sims": search.sims_done,
+        "seed": args.seed,
+        "batch": args.batch,
+        "best_overhang": best,
+        "harmonic": base,
+        "sequence": [
+            {"layer": L, "j": j, "x": j * args.dx} for (L, j) in seq
+        ],
+        "prefix_trace": [
+            {"layer": L, "x": x, "margin": margin, "status": status}
+            for (L, j, x, margin, status) in trace
+        ],
+        "prefix_feasible": all_feasible,
+    }
+    js = os.path.join(args.out, f"fast_best_n{args.n}_dx{round(1 / args.dx)}.json")
+    with open(js, "w") as f:
+        json.dump(record, f, indent=1)
+    print(f"wrote {js}")
 
     return 0
 

@@ -12,6 +12,7 @@ Run: python examples/replay_steps.py --out out/search
 """
 
 import argparse
+import json
 import os
 
 import matplotlib
@@ -44,15 +45,27 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="out/search")
     ap.add_argument("--mu", type=float, default=0.7)
+    ap.add_argument(
+        "--seq", default=None,
+        help="JSON record written by search_overhang_fast.py; "
+             "defaults to the built-in n=4 counterweight sequence",
+    )
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
     tol = Tolerances()
-    seq = N4_COUNTERWEIGHT
+    if args.seq is not None:
+        with open(args.seq) as f:
+            record = json.load(f)
+        seq = [(p["layer"], p["x"]) for p in record["sequence"]]
+    else:
+        seq = N4_COUNTERWEIGHT
     n = len(seq)
 
-    fig, axes = plt.subplots(1, n, figsize=(4.2 * n, 4.6), sharey=True)
-    for k, ax in enumerate(axes):
+    fig, axes = plt.subplots(
+        1, n, figsize=(4.2 * n, 4.6), sharey=True, squeeze=False
+    )
+    for k, ax in enumerate(axes[0]):
         boxes = [pedestal()] + [cube(L, x) for L, x in seq[: k + 1]]
         a = build_assembly(boxes, mu=args.mu, tol=tol, dim=2)
         s = assemble(a, tol, cone="linear2d")
@@ -65,7 +78,7 @@ def main():
         )
         print(f"step {k + 1}: {r.status}  margin={r.margin:.3e}  edge={edge:+.4f}")
 
-    path = os.path.join(args.out, "steps_n4.png")
+    path = os.path.join(args.out, f"steps_n{n}.png")
     fig.savefig(path, dpi=180, bbox_inches="tight", facecolor="white")
     print(f"wrote {path}")
 
