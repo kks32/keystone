@@ -54,7 +54,7 @@ def test_classify_prop():
     # A cube boxed in on both sides at its layer and covered above: the column
     # is blocked (drop out) and both lateral corridors are blocked (ride_under
     # out), so it falls through to a prop. The cube is otherwise base-legal, so
-    # the prop classification is genuinely from reachability.
+    # the prop classification comes from reachability alone, not illegality.
     dx = 1.0 / 6.0
     seq = [(0, 0), (1, -7), (1, 7), (2, -3), (1, 0)]
     blocks = classify_build(n=6, dx=dx, seq=seq)
