@@ -15,7 +15,10 @@ measures and reports gaps; it never tunes keystone to match MuJoCo.
 from .mujoco_io import (
     aabb_adjacent_pairs,
     assembly_diagonal,
+    capped_impedance_wrench,
     from_mjcf,
+    orientation_error,
+    restacked_cubes,
     settle_test,
     to_mjcf,
 )
@@ -23,7 +26,10 @@ from .mujoco_io import (
 __all__ = [
     "aabb_adjacent_pairs",
     "assembly_diagonal",
+    "capped_impedance_wrench",
     "from_mjcf",
+    "orientation_error",
+    "restacked_cubes",
     "settle_test",
     "to_mjcf",
 ]

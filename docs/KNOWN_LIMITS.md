@@ -233,7 +233,7 @@ reports both the default-softness result and a stiffness sweep. Resolution: read
 the rotation channel alongside displacement, or run the sweep, when a stack fails
 on displacement alone.
 
-## Placement motions are obstructed for both reacher designs (2026-07-16)
+## Placement motions are obstructed for both reacher designs (2026-07-16, updated 2026-07-16)
 
 The first entry in this file records the lattice placement-reachability modes
 (static, drop, slide) added to the search layer. Those modes reason about clear
@@ -268,3 +268,52 @@ rigid placement path exists for the reacher. The lattice modes are necessary but
 not sufficient; they need a swept-volume and end-effector check for real hardware.
 Resolution: that check belongs to the robot planner, or the grid needs sub-unit
 clearance; the solver certifies statics only. Numbers: out/mujoco/mujoco_insert.json.
+
+Update, Route A: block tolerance plus compliant insertion does not rescue the
+reacher slide, and the reason is structural, not a tuning gap. Shrinking every
+cube by size_tol (in-plane side 1 - size_tol) and re-stacking so vertical
+contacts meet keeps the full designs certified feasible at every tested
+tolerance (clamp margin 1.9e-11 to 1.8e-11, n6 2.7e-11 across size_tol 0 to
+0.02), but the reacher slot never opens: its floor and ceiling are blocks that
+shrink with the reacher, so the slot height stays exactly one reacher height.
+The opposite assignment, nominal slot with a shortened reacher, opens a
+size_tol gap under the clamping block and is certified infeasible for any
+gap > 0 (clamp margin 7.7e-3, n6 6.2e-3): the clearance a rigid slide needs is
+the clamp contact that holds the reacher up. Replacing the rigid weld drive
+with a capped impedance driver (spring-damper on the free block, force capped
+at max_push) converts the 700x jam into a bounded outcome, but the slide still
+fails at every tolerance: at cap 1x block weight the reacher stalls 0.61 m
+short with the structure intact and retrievable; at 2x and above it wedges at
+the bridge edge (stops 0.05 to 0.07 m short) and the shove topples the
+knife-edge structure during insertion, not after release. Two shrunk-geometry
+side effects are worth recording: uniform in-plane shrink turns the certified
+counterweight prefix infeasible (its center of mass moves past the shrunk
+support edge, margin 2.4e-4 at size_tol 0.005), so the shrunk designs are not
+prefix-buildable in the certified order either. Route A is closed for this
+topology: no (design, size_tol) pair in {clamp 31/24, n6 4/3} x {0, 0.005,
+0.0075, 0.01, 0.02} inserts cleanly and stands. Numbers and the full table:
+out/mujoco/mujoco_insert.json (route_a).
+
+Update, Route B: falsework executes both designs with drops only,
+examples/mujoco_falsework.py. Slender prop columns are declared under every
+overhang that is unstable before its counterweight or clamp arrives (reacher
+prop on the ground, counterweight prop on the pedestal, plus a base prop for
+n6 whose base cube sits centered on the pedestal edge), each propped prefix is
+certified through the host pipeline as an ordinary block assembly (all
+feasible, margins 4e-12 to 1.4e-11), the build runs as capped-impedance drops
+onto the propped structure, and the props retract one at a time on
+position-actuated sliders. Execution details that mattered: props are set as
+catchers 1 mm shy of the underside (a flush static prop over-constrains the
+drop press and ejects the block), and prop tops in the retraction model are
+set from settled poses with the same relief (a flush slider-held prop drags
+the block during slide-out). All drops seat to within 2.3 mm, prop peak loads
+stay under 4.3x block weight during placement impacts and read zero before
+retraction (the finished clamp carries itself). Outcome: the n6 4/3 certified
+optimum builds and stands after retraction (rotation 0.010); the clamp 31/24
+executes cleanly but creep-topples after retraction exactly like its
+exact-pose control (the zero-margin knife-edge creeps about 0.0026 rad/s under
+MuJoCo's compliant contacts at solref 0.002 and is unstable by 6 s with no
+build involved), and backing the reacher off two grid steps (29/24) gives a
+falsework build that stands. The practical ladder at n=4, dx=1/24 is
+therefore: statically certified 31/24, falsework-buildable-and-standing 29/24,
+clear-space (drop) 1. Numbers: out/mujoco/mujoco_falsework.json.

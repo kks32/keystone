@@ -76,6 +76,43 @@ def aabb_adjacent_pairs(
     return pairs
 
 
+def restacked_cubes(
+    cells: Sequence[tuple[int, int]],
+    size_tol: float,
+    dx: float,
+    *,
+    pedestal_top: float = 1.0,
+    unit: float = 1.0,
+    density: float = 2000.0,
+) -> list[Box]:
+    """Unit cubes shrunk by `size_tol` and re-stacked so vertical contacts meet.
+
+    A block-tolerance model for the placement demos. Each cube's in-plane (x, z)
+    half-extents shrink by `size_tol / 2` per face, so a full side becomes
+    `unit - size_tol`; the out-of-plane depth stays `unit` (the 2D slice keeps
+    unit depth, so weight per block scales only with the in-plane shrink).
+
+    Centers keep the nominal grid x = j * dx. Center z is re-stacked to
+    `pedestal_top + (layer + 0.5) * (unit - size_tol)`, so layer L's top meets
+    layer L+1's bottom exactly and every cube rests on the one below. Horizontal
+    gaps of `size_tol` open between same-layer neighbors. The vertical slot a
+    same-layer block slides through does not open: its walls are blocks that
+    shrink with it.
+
+    cells: (layer, grid_index_j) entries. Returns one Box per cell, in order.
+    """
+    if not 0.0 <= size_tol < unit:
+        raise ValueError(f"size_tol must be in [0, {unit}), got {size_tol}")
+    side = unit - size_tol
+    half = np.array([side / 2.0, unit / 2.0, side / 2.0])
+    out: list[Box] = []
+    for (layer, j) in cells:
+        x = j * dx
+        z = pedestal_top + (int(layer) + 0.5) * side
+        out.append(Box(half.copy(), np.array([x, 0.0, z]), density=density))
+    return out
+
+
 def to_mjcf(
     boxes: Sequence[Box],
     mu: float,
@@ -89,6 +126,8 @@ def to_mjcf(
     condim: int = 3,
     extra_worldbody: str = "",
     extra_equality: str = "",
+    extra_pairs: str = "",
+    extra_actuator: str = "",
     model_name: str = "keystone",
 ) -> str:
     """Export boxes to an MJCF string (PLAN.md Section 8.1).
@@ -106,6 +145,10 @@ def to_mjcf(
     condim: contact dimensionality, 3 = sliding friction only.
     extra_worldbody, extra_equality: raw XML appended inside <worldbody> and
           <equality> (mocap bodies and weld constraints for the insertion demo).
+    extra_pairs: raw <pair> XML appended inside <contact> (contacts for a body
+          not in `boxes`, for example a falsework prop).
+    extra_actuator: raw XML wrapped in an <actuator> block (the prop's position
+          servo for the falsework demo). Empty means no actuator block.
     """
     boxes = list(boxes)
     n = len(boxes)
@@ -180,7 +223,15 @@ def to_mjcf(
             f'    <pair geom1="geom{i}" geom2="geom{j}" '
             f'condim="{condim}" friction="{fric}"{solref_attr}{solimp_attr}/>'
         )
+    if extra_pairs:
+        lines.append(extra_pairs)
     lines.append("  </contact>")
+
+    if extra_actuator:
+        lines.append("  <actuator>")
+        lines.append(extra_actuator)
+        lines.append("  </actuator>")
+
     lines.append("</mujoco>")
     return "\n".join(lines)
 
@@ -349,3 +400,77 @@ def settle_test(
         "disp_tol_rel": disp_tol_rel,
         "rot_tol": rot_tol,
     }
+
+
+def _quat_mul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Hamilton product of two (w, x, y, z) quaternions."""
+    aw, ax, ay, az = a
+    bw, bx, by, bz = b
+    return np.array(
+        [
+            aw * bw - ax * bx - ay * by - az * bz,
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+        ]
+    )
+
+
+def orientation_error(q_cur: np.ndarray, q_target: np.ndarray) -> np.ndarray:
+    """World-frame rotation vector that turns q_cur into q_target.
+
+    The vector's direction is the rotation axis and its magnitude the angle in
+    radians. Both quaternions are (w, x, y, z). The shortest rotation is chosen
+    (the result angle is in [0, pi])."""
+    q_cur = np.asarray(q_cur, dtype=np.float64)
+    q_target = np.asarray(q_target, dtype=np.float64)
+    conj = np.array([q_cur[0], -q_cur[1], -q_cur[2], -q_cur[3]])
+    err = _quat_mul(q_target, conj)
+    if err[0] < 0.0:
+        err = -err  # take the shortest arc
+    v = err[1:4]
+    s = float(np.linalg.norm(v))
+    if s < 1e-12:
+        return np.zeros(3)
+    angle = 2.0 * float(np.arctan2(s, err[0]))
+    return (angle / s) * v
+
+
+def capped_impedance_wrench(
+    pos: np.ndarray,
+    quat: np.ndarray,
+    target_pos: np.ndarray,
+    target_quat: np.ndarray,
+    linvel: np.ndarray,
+    angvel: np.ndarray,
+    *,
+    kp: float,
+    kd: float,
+    kp_rot: float,
+    kd_rot: float,
+    max_push: float,
+    max_torque: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Impedance wrench for the compliant insertion driver (world frame).
+
+    force  = kp * (target_pos - pos) - kd * linvel, magnitude clipped to
+             `max_push`.
+    torque = kp_rot * orientation_error(quat, target_quat) - kd_rot * angvel,
+             magnitude clipped to `max_torque`.
+
+    Clipping the linear force is the safety property: a wedged block can push no
+    harder than `max_push`, so a zero-clearance jam stalls it instead of driving
+    unbounded force into the structure. All inputs and outputs are world frame.
+    Returns (force, torque), each shape (3,)."""
+    pos = np.asarray(pos, dtype=np.float64)
+    target_pos = np.asarray(target_pos, dtype=np.float64)
+    force = kp * (target_pos - pos) - kd * np.asarray(linvel, dtype=np.float64)
+    fmag = float(np.linalg.norm(force))
+    if fmag > max_push and fmag > 0.0:
+        force = force * (max_push / fmag)
+    rotvec = orientation_error(quat, target_quat)
+    torque = kp_rot * rotvec - kd_rot * np.asarray(angvel, dtype=np.float64)
+    tmag = float(np.linalg.norm(torque))
+    if tmag > max_torque and tmag > 0.0:
+        torque = torque * (max_torque / tmag)
+    return force, torque
