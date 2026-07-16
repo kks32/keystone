@@ -139,7 +139,14 @@ already slower than qpax). In the search a false INFEASIBLE only prunes
 exploration; the certified re-verification of improving states recovers the
 boundary states that matter for the reported best. The n=4 sims=500 seed=0
 search returns the same best overhang and sequence under both screeners, which
-CI asserts.
+CI asserts. At larger budgets the two searches diverge: at sims=2000 the qpax
+search finds deeper counterweighted structures (best 0.958 at n=4, 1.000 at
+n=6) that the screened tree has permanently pruned (best 0.708, unchanged even
+with 6x more simulations; see `out/search/search_perf_pdhg.txt`). The pdhg
+screener trades search quality at equal simulations for a 6x wall-time
+speedup on CPU; on this objective, which rewards exactly the boundary states
+the screen resolves worst, that trade is currently unfavorable at large
+budgets.
 
 Acceleration on infeasible instances: the primal Nesterov wrapper is restarted
 adaptively and extrapolates the primal only. Dual momentum is deliberately off;
