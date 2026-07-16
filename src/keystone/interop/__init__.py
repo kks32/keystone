@@ -12,6 +12,16 @@ verdict is an upper estimate by construction (PLAN.md Section 8.4). The bridge
 measures and reports gaps; it never tunes keystone to match MuJoCo.
 """
 
+from .franka_scene import (
+    SceneInfo,
+    compose_scene,
+    design_cert_boxes,
+    dls_ik,
+    prop_cert_boxes,
+    reset_home,
+    staging_world,
+    target_world,
+)
 from .mujoco_io import (
     aabb_adjacent_pairs,
     assembly_diagonal,
@@ -25,13 +35,21 @@ from .mujoco_io import (
 )
 
 __all__ = [
+    "SceneInfo",
     "aabb_adjacent_pairs",
     "assembly_diagonal",
     "capped_impedance_wrench",
+    "compose_scene",
+    "design_cert_boxes",
+    "dls_ik",
     "from_mjcf",
     "orientation_error",
+    "prop_cert_boxes",
+    "reset_home",
     "restacked_cubes",
     "settle_test",
     "split_reacher",
+    "staging_world",
+    "target_world",
     "to_mjcf",
 ]

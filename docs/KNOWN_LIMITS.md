@@ -366,3 +366,55 @@ statically certified optimum; the full 31/24 optimum inserts cleanly but its spl
 creep-topples. The insertion blocker is removed; the shim seam pays for it in
 overhang. Numbers and the standing-threshold scan: out/mujoco/mujoco_shim.json;
 build movie out/mujoco/shim_movie_clamp_26_24_eps0.02.gif.
+
+## Robotic-arm build: manipulation scope and sim enablers (2026-07-16)
+
+examples/franka_build.py replaces the invisible-hand falsework driver with a
+menagerie Franka Panda that picks each cube from a staging row and builds the
+clamp 29/24 falsework design end to end at 1/20 scale (cube side 0.05 m,
+0.25 kg; keystone margins are scale-invariant, re-certified in the run to
+float precision, and the propped prefixes certify identically at both scales).
+The build succeeds: placements 0.2 to 2.7 mm, props strike at under 0.7 N,
+the structure stands after retraction (rotation 0.017 rad). Scope limits:
+
+- Single arm. The falsework route is fully single-arm (top-grasp drops plus
+  prop retraction on scene actuators). The hold-and-shim 26/24 build needs one
+  hand to hold the short reacher while another drives the shim; it is out of
+  scope here.
+- Scripted waypoints, no motion planning. Collisions are avoided by
+  construction: every approach is a vertical descent over a column the
+  certified drop order keeps clear. Fingertip-pad contact with non-carried
+  cubes is monitored and is zero in the clean run; the tightest measured
+  margins are the counterweight and bridge descents, whose pads pass 12.6 mm
+  above the block below (the pads grip the cube's top half and protrude
+  12.4 mm below its center). Only the fingertip pads carry contact pairs with
+  the cubes; a collision by any other arm link would be unmodeled. The planar
+  designs guarantee the y faces of every cube stay free, which is what the
+  fixed y-pinch needs.
+- No grasp planning. Fixed y-pinch at the cube center, top grasp only.
+- Cube-pose feedback (a vision stand-in; simulator poses) is used three
+  times: hover correction, final alignment, and seat detection before
+  release. This is load-bearing. Open-loop placement through the same arm
+  misses by 3 to 27 mm: in-grasp slip along the unconstrained pinch axis,
+  arm-servo gravity sag, and finger-opening drag (1.7 mm) accumulate, and
+  the 27 mm bridge miss lands the bridge entirely on the counterweight, so
+  the clamp never forms and the reacher falls at retraction. That ladder,
+  27 mm open loop versus 0.5 mm closed loop on a 50 mm cube, is the measured
+  cost of open-loop manipulation on this design.
+- Sim enablers, both in-memory (the menagerie file on disk is untouched).
+  The gripper tendon servo is stiffened from 100 to 1000 N/m: the stock
+  servo pinches a 0.05 m cube at 2.8 N, below the 2.45 N cube weight at
+  mu 1.0, and the cube slips out during the first lift. The steady pinch
+  becomes 23 N with transient peaks to 72 N, at the real hand's 70 N
+  continuous spec boundary. Contacts run elliptic cones with impratio 10:
+  MuJoCo's regularized pyramidal friction lets the pinched cube creep down
+  the fingers at a measured 2.0 mm/s, which ate the descent clearance and
+  rammed the carried counterweight into the base; elliptic plus impratio 10
+  cuts the creep to 0.05 mm/s. Structural contacts share the option, so the
+  settle physics differs slightly from the pyramidal-cone falsework runs.
+- MuJoCo dynamics are not scale-invariant (contact time constants, servo
+  bandwidths), so the executed build is evidence at the 0.05 m scale
+  specifically; the statics are scale-free by the property tests.
+
+Numbers, per-block table, and renders: out/mujoco/franka_build.json,
+franka_build.gif, franka_build.mp4.
