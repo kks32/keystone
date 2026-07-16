@@ -19,6 +19,34 @@ and depth 100 m. The two-L design still stands; only the 2D depth dependence is
 removed. `bbox_diagonal` now raises a clear ValueError on a single floating block
 with no patches (zero spatial extent) instead of returning L = 0.
 
+## Gap convention: g_tol is the maximum total face separation (2026-07-15)
+
+`g_tol` means the largest total separation of a contact, the distance between
+the two opposing faces. The ground path measures a block face directly against
+z = 0 and accepts up to `g_tol * L`. The block-block path measures each corner
+deviation from the mid-plane and accepts up to `g_tol * L / 2`, so the total
+separation (twice the mid-plane deviation for parallel faces) also stays within
+`g_tol * L`. Before this change the block-block path spent `g_tol * L` on the
+mid-plane deviation, which admitted total separations up to `2 * g_tol * L`,
+twice the ground budget. The two paths now share one meaning of `g_tol`.
+Borderline detection tests were recomputed against the halved block-block
+threshold.
+
+## Interpenetration checking is AABB-conservative only (2026-07-15)
+
+`check_no_interpenetration` in `interfaces.py` runs at the top of both 2D and
+3D detection. It flags a pair only when the two world axis-aligned bounding
+boxes overlap by more than `2 * g_tol * L` on every axis at once, and raises a
+ValueError naming the pair. This is a cheap guard against gross modeling
+errors (for example two coincident blocks), not full collision rejection. It
+uses AABBs, so it can miss oriented-box overlaps that no axis-aligned box
+reveals, and it never flags a legitimate tight contact because the overlap on
+the contact-normal axis stays near zero (contact penetration is bounded by
+`g_tol * L`). A pair tilted so one corner dips more than `2 * g_tol * L` into
+the neighbor is flagged even though the faces nearly meet at their centers;
+that is the intended catch for an overlapping input. Resolution: a proper
+narrow-phase separating-axis test lands with the mesh pipeline (M2 onward).
+
 ## Verdicts at exact analytic boundaries (2026-07-15)
 
 At a mathematically exact limit state (corbel scale c = 1.0), the P4 margin lands
@@ -81,3 +109,41 @@ applied wrenches, arbitrary directions) need `dataclasses.replace` on the
 
 Not reachable in the cube slice (box faces clip to convex polygons). The v1 policy
 for the mesh pipeline remains: drop polygons with holes and log a warning.
+
+## PDHG screening semantics (2026-07-15)
+
+`solve.pdhg.pdhg_margin` is a fixed-iteration first-order screen of the P4
+problem, not a certifier. FEASIBLE claims that reach a user always come from the
+certified path (`margin_core` plus the verified verdict, or `solve_p0_exact`).
+The search (`search.mcts`, `screener="pdhg"`) uses screened margins for expansion
+admissibility only and gates every best-overhang update on a certified qpax
+re-verification.
+
+Error direction, measured, not proven: on the fixed-seed validation study in
+`tests/unit/test_pdhg.py` (500 random reachable lattice states from the n=4 and
+n=6 specs plus 10 states within 2 grid steps of the stacked-pair e = b/2 and
+harmonic-corbel boundaries), the screen produced zero false FEASIBLE verdicts at
+every tested iteration count (50 to 800, cold and warm started). A feasible
+state's screened margin decreases toward zero from above, so truncation reads
+conservative. This is an empirical property of this problem family, asserted in
+CI, and not a theorem; a new problem family needs its own study.
+
+False INFEASIBLE is common and expected: at the default 400 iterations about half
+of the certified-feasible study states still screen infeasible, because feasible
+states adjacent to an analytic boundary have certified margins within 10x of
+`tol_feas` (the escalation band above) and a few hundred first-order iterations
+cannot resolve a residual to 1e-8 on systems with cond(A^T A) in the thousands.
+The target of a sub-2 % false-infeasible rate was not reachable at any tested
+iteration count (still 4.8 % on n=6 at 6400 iterations, where the screen is
+already slower than qpax). In the search a false INFEASIBLE only prunes
+exploration; the certified re-verification of improving states recovers the
+boundary states that matter for the reported best. The n=4 sims=500 seed=0
+search returns the same best overhang and sequence under both screeners, which
+CI asserts.
+
+Acceleration on infeasible instances: the primal Nesterov wrapper is restarted
+adaptively and extrapolates the primal only. Dual momentum is deliberately off;
+an infeasible instance has no saddle point, its dual iterate grows without
+bound, and momentum on it compounds the growth geometrically (observed 1e5
+margin overshoot). With primal-only momentum the screened margin of an
+infeasible state stays finite and tracks the true residual infimum from above.

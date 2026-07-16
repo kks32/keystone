@@ -1,5 +1,54 @@
 # CHANGELOG
 
+## 0.0.1 (2026-07-15, unreleased) - escalation, KKT certificate, bound review
+
+Second solver-layer review pass. Fixes verdict escalation, exact-oracle
+certificate enforcement, the margin optimality certificate, the P4 gradient,
+and bound-direction semantics.
+
+- P2/P3 escalation propagation. When a NO_CONVERGE QP escalates and the exact
+  oracle certifies FEASIBLE, the returned force state is now the oracle's
+  recomputed-residual-checked forces, not the uncertified QP iterate;
+  info["certified_by"] / info["forces_certified_by"] name the deciding
+  backend. solve_p2 no longer returns lambda_assoc = hi with uncertified
+  forces: an uncertified hi endpoint falls back to the last certified
+  feasible lambda and records info["uncertified_band"]. solve_p3 no longer
+  treats a NO_CONVERGE mu_lo as infeasible (records
+  info["uncertified_at_mu_lo"] and keeps the certified bracket), never
+  returns a NO_CONVERGE mu_hi as INFEASIBLE, and takes feasible-at-mu_lo
+  forces from the low endpoint.
+- Exact oracle certificate enforcement. solve_p0_exact / solve_p2_exact
+  recompute the equilibrium residual and cone violation from a HiGHS-feasible
+  primal (tol_eq / tol_cone) and return NO_CONVERGE if the check fails; a
+  HiGHS-infeasible verdict whose explicit Farkas certificate fails validation
+  returns NO_CONVERGE, not INFEASIBLE. solve_p2_exact extracts the equality
+  duals (res.eqlin.marginals, valid at an LP optimum) as the collapse
+  mechanism at an uncensored optimum, orients them for nonnegative
+  gravitational power, and records info["complementary_slackness"]. Every
+  INFEASIBLE Result from any solver now carries a mechanism (solve_p4 no
+  longer omits it); the invariant is tested across P0, P4, P2, P3, and both
+  exact solvers.
+- margin_certified is now a full KKT check. margin_core returns the four
+  slack-QP residuals (stationarity, equality, inequality violation,
+  complementarity), mirroring qpax's own convergence test, and
+  margin_certified requires all four below tol_gap (info["kkt"] records
+  them). The Result margin docstring is corrected: a cone-admissible iterate
+  upper-bounds the optimal P4 margin; a cone-violating iterate does not bound
+  it. margin_core's return grew from 7 to 11 values.
+- margin_and_grad reports the recomputed-residual margin (||A f + w|| /
+  ||w||), matching solve_p4 on any iterate rather than the internal slack.
+  SolverOptions gained target_kappa (default 1e-3, qpax's value); gradients
+  are taken at a relaxed KKT point with this complementarity smoothing. A
+  central-difference test on the toy block (mu = 0.2, lam = 0.5) at
+  target_kappa = 1e-5 measures relative error ~3e-4 (< 1e-3); the qpax
+  default 1e-3 measures ~2.4e-2, recorded not asserted.
+- Bound semantics. physical_bound_direction is populated only when a capacity
+  factor is reported: P0/P4 set None; a censored P2 factor and a pyramid P3
+  critical friction are "unknown" (unordered vs true); only an uncensored
+  linear-2D P2 factor is "upper" and only a linear-2D P3 factor is "lower".
+  MATH_REFERENCE.md bound-directions paragraph updated for the P3 pyramid and
+  censored cases.
+
 ## 0.0.1 (2026-07-15, unreleased) - certified verdicts and bound semantics
 
 Solver-layer review fixes. Verdicts are now verified against recomputed

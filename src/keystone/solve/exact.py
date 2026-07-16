@@ -12,6 +12,15 @@ On infeasibility the mechanism is a validated Farkas ray. scipy's
 eqlin.marginals is not a Farkas ray for an infeasible LP, so the ray comes
 from an explicit normalized certificate LP and is checked numerically
 before it is returned (see _farkas_certificate).
+
+At a P2 optimum eqlin.marginals is valid: the equality duals of the
+maximize-lambda LP are the kinematic collapse mechanism. solve_p2_exact
+extracts them at an uncensored optimum, orients and normalizes the ray, and
+records the complementary-slackness residual in info. Every verdict is
+independently rechecked: a HiGHS-feasible primal is accepted only after its
+recomputed equilibrium residual and cone violation clear tol_eq / tol_cone,
+and a HiGHS-infeasible verdict only after the Farkas certificate validates;
+either check failing yields NO_CONVERGE, never a false FEASIBLE/INFEASIBLE.
 """
 
 import numpy as np
@@ -38,11 +47,50 @@ def _highs_opts(tol: Tolerances) -> dict:
     }
 
 
-def _lambda_bound(cone: str):
-    """(physical_bound_direction, info bound tag) for a load-factor verdict."""
+def _p2_bound(cone: str, censored: bool):
+    """(physical_bound_direction, info bound tag) for a P2 load factor.
+
+    A linear 2D uncensored associative load factor overestimates true
+    Coulomb capacity ("upper"). An inscribed pyramid combines an
+    associative overestimate with a cone underestimate, so it is unordered
+    vs true ("unknown"). A censored factor is only a cap that lower-bounds
+    associative capacity; it is unordered vs true even in 2D ("unknown").
+    """
+    if censored:
+        return "unknown", "censored-lower-of-assoc-unordered-vs-true"
     if cone == "linear2d":
         return "upper", "upper-of-true-assoc-exact"
     return "unknown", "lower-of-assoc-exact-unordered-vs-true"
+
+
+def _primal_residual(A, w, G, f):
+    """Recomputed equilibrium residual margin and cone violation for f.
+
+    margin = ||A f + w|| / ||w||, viol = max(0, max(G f)). Same rule as the
+    JAX path so the two backends certify feasibility identically.
+    """
+    r = A @ f + w
+    norm_w = float(np.linalg.norm(w))
+    denom = max(norm_w, float(np.finfo(float).tiny))
+    margin = float(np.linalg.norm(r) / denom)
+    viol = float(max(0.0, float(np.max(G @ f)))) if G.shape[0] else 0.0
+    return margin, viol
+
+
+def _complementary_slackness(G, f, z):
+    """Scaled max complementary-slackness violation for G f <= 0, duals z.
+
+    slack_i = -(G f)_i >= 0 at a feasible optimum, z_i the inequality dual.
+    Complementary slackness asks z_i * slack_i = 0 for every row. Report the
+    max product normalized by the dual and slack magnitudes so the threshold
+    is dimensionless and comparable to tol_dual.
+    """
+    if G.shape[0] == 0:
+        return 0.0
+    slack = -(G @ f)
+    zscale = max(1.0, float(np.max(np.abs(z))))
+    sscale = max(1.0, float(np.max(np.abs(slack))))
+    return float(np.max(np.abs(z * slack)) / (zscale * sscale))
 
 
 def _farkas_certificate(A, w, G, dim, tol):
@@ -102,7 +150,13 @@ def solve_p0_exact(system: EquilibriumSystem, tol: Tolerances) -> Result:
     """P0 feasibility as an LP. minimize 0 s.t. A f = -w_dead, G f <= 0.
 
     Forces are free; the cone rows in G carry n >= 0. tol wires HiGHS
-    feasibility options and the certificate tolerances.
+    feasibility options and the certificate tolerances. P0 reports no
+    capacity factor, so physical_bound_direction is None.
+
+    A HiGHS-feasible primal is accepted only after the recomputed
+    equilibrium residual and cone violation clear tol_eq / tol_cone;
+    otherwise NO_CONVERGE. A HiGHS-infeasible verdict is accepted only after
+    the explicit Farkas certificate validates; otherwise NO_CONVERGE.
     """
     A = np.asarray(system.A)
     w = np.asarray(system.w_dead)
@@ -120,21 +174,32 @@ def solve_p0_exact(system: EquilibriumSystem, tol: Tolerances) -> Result:
         c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds,
         method="highs", options=_highs_opts(tol),
     )
-    direction, tag = _lambda_bound(system.cone)
     info = {
         "scipy_status": int(res.status),
         "message": str(res.message),
         "note": "exact LP feasibility; no elastic margin",
-        "bound": tag,
     }
-    common = dict(cone_model=system.cone, physical_bound_direction=direction)
+    # P0 reports no capacity factor (charter: bound direction only on a factor).
+    common = dict(cone_model=system.cone, physical_bound_direction=None)
     if res.success:
-        forces = np.asarray(res.x) * float(system.W)
-        return Result(status=FEASIBLE, margin=0.0, forces=forces, info=info, **common)
+        f = np.asarray(res.x)
+        margin, viol = _primal_residual(A, w, G, f)
+        info["recomputed_margin"] = margin
+        info["recomputed_viol"] = viol
+        if np.all(np.isfinite(f)) and margin <= tol.tol_eq and viol <= tol.tol_cone:
+            return Result(
+                status=FEASIBLE, margin=0.0, forces=f * float(system.W),
+                info=info, **common,
+            )
+        info["note"] = "HiGHS feasible but recomputed residual/cone check failed"
+        return Result(status=NO_CONVERGE, margin=float("inf"), info=info, **common)
     if res.status == _SCIPY_INFEASIBLE:
         mechanism, farkas = _farkas_certificate(A, w, G, system.dim, tol)
         info["farkas"] = farkas
         info["load_power"] = farkas["load_power"]
+        if not farkas["certified"]:
+            info["note"] = "HiGHS infeasible but Farkas certificate failed validation"
+            return Result(status=NO_CONVERGE, margin=float("inf"), info=info, **common)
         return Result(
             status=INFEASIBLE, margin=float("inf"), mechanism=mechanism,
             info=info, **common,
@@ -163,6 +228,7 @@ def solve_p2_exact(
     G = np.asarray(system.G)
     nrows, nf = A.shape
     ncone = G.shape[0]
+    rpb = 3 if system.dim == 2 else 6
 
     # Variables [f, lam]; maximize lam is minimize -lam.
     c = np.zeros(nf + 1)
@@ -177,29 +243,62 @@ def solve_p2_exact(
         c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds,
         method="highs", options=_highs_opts(tol),
     )
-    direction, tag = _lambda_bound(system.cone)
     info = {
         "scipy_status": int(res.status),
         "message": str(res.message),
         "lam_hi": float(lam_hi),
-        "bound": tag,
     }
-    common = dict(cone_model=system.cone, physical_bound_direction=direction)
     if res.success:
         lam = float(res.x[-1])
-        forces = np.asarray(res.x[:nf]) * float(system.W)
-        if lam >= float(lam_hi) - tol.tol_feas:
+        f = np.asarray(res.x[:nf])
+        censored = lam >= float(lam_hi) - tol.tol_feas
+        # Recompute the residual and cone violation on the loaded state.
+        w_total = w_dead + lam * w_live
+        margin, viol = _primal_residual(A, w_total, G, f)
+        info["recomputed_margin"] = margin
+        info["recomputed_viol"] = viol
+        direction, tag = _p2_bound(system.cone, censored)
+        info["bound"] = tag
+        common = dict(cone_model=system.cone, physical_bound_direction=direction)
+        if not (np.all(np.isfinite(f)) and margin <= tol.tol_eq
+                and viol <= tol.tol_cone):
+            info["note"] = "HiGHS feasible but recomputed residual/cone check failed"
+            return Result(status=NO_CONVERGE, margin=float("inf"), info=info, **common)
+        if censored:
             info["censored"] = True
             info["note"] = "lambda hit lam_hi cap; lambda_assoc is a cap"
+        # Mechanism from the equality duals, valid at an LP optimum. Orient so
+        # gravity does nonnegative power, then normalize. Only at an uncensored
+        # optimum is this a physical collapse mechanism; a censored optimum is
+        # the capped problem, so no mechanism is attached.
+        mechanism = None
+        y = np.asarray(res.eqlin.marginals, dtype=float)
+        if float(y @ w_dead) < 0.0:
+            y = -y
+        norm_y = float(np.linalg.norm(y))
+        yn = y / norm_y if norm_y > 0.0 else y
+        z = np.asarray(res.ineqlin.marginals, dtype=float)
+        cs = _complementary_slackness(G, f, z)
+        info["complementary_slackness"] = cs
+        info["complementary_slackness_ok"] = bool(cs <= tol.tol_dual)
+        if not censored:
+            mechanism = yn.reshape(nrows // rpb, rpb)
         return Result(
-            status=FEASIBLE, margin=0.0, forces=forces, lambda_assoc=lam,
-            info=info, **common,
+            status=FEASIBLE, margin=0.0, forces=f * float(system.W),
+            lambda_assoc=lam, mechanism=mechanism, info=info, **common,
         )
+    # lam = 0 is fixed geometry, so an uncensored bound tag applies here.
+    direction, tag = _p2_bound(system.cone, False)
+    info["bound"] = tag
+    common = dict(cone_model=system.cone, physical_bound_direction=direction)
     if res.status == _SCIPY_INFEASIBLE:
         # Infeasible even at lam = 0. No positive load factor exists.
         mechanism, farkas = _farkas_certificate(A, w_dead, G, system.dim, tol)
         info["farkas"] = farkas
         info["load_power"] = farkas["load_power"]
+        if not farkas["certified"]:
+            info["note"] = "HiGHS infeasible but Farkas certificate failed validation"
+            return Result(status=NO_CONVERGE, margin=float("inf"), info=info, **common)
         return Result(
             status=INFEASIBLE, margin=float("inf"), lambda_assoc=0.0,
             mechanism=mechanism, info=info, **common,

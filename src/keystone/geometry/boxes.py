@@ -30,18 +30,24 @@ class Box:
 
     def __post_init__(self):
         he = np.asarray(self.half_extents, dtype=np.float64)
+        if he.shape != (3,):
+            raise ValueError(f"half_extents must have shape (3,), got {he.shape}")
         if not np.all(np.isfinite(he)):
             raise ValueError(f"half_extents must be finite, got {he}")
         if np.any(he <= 0.0):
             raise ValueError(f"half_extents must be positive, got {he}")
         object.__setattr__(self, "half_extents", he)
         pos = np.asarray(self.position, dtype=np.float64)
+        if pos.shape != (3,):
+            raise ValueError(f"position must have shape (3,), got {pos.shape}")
         if not np.all(np.isfinite(pos)):
             raise ValueError(f"position must be finite, got {pos}")
         object.__setattr__(self, "position", pos)
         if not np.isfinite(self.density) or self.density <= 0.0:
             raise ValueError(f"density must be finite and positive, got {self.density}")
         q = np.asarray(self.quat, dtype=np.float64)
+        if q.shape != (4,):
+            raise ValueError(f"quat must have shape (4,), got {q.shape}")
         n = np.linalg.norm(q)
         if not np.isclose(n, 1.0, rtol=0, atol=1e-9):
             raise ValueError(f"quaternion norm {n} is not 1")

@@ -28,8 +28,15 @@ from keystone.solve import (
 )
 from keystone.solve.batch_jax import (
     _dual_cone_violation,
+    _jit_margin,
+    _p2_bound,
+    _p3_bound,
+    _resolve_verdict,
     _verify_farkas,
     margin_core,
+    solve_p2,
+    solve_p3,
+    solve_p4,
 )
 
 TOL = Tolerances()
@@ -80,17 +87,24 @@ def offset():
 
 # --- margin_core signature --------------------------------------------------
 
-def test_margin_core_returns_seven():
+def test_margin_core_returns_eleven():
     out = margin_core(
         jnp.asarray(A_BLOCK), jnp.asarray(W_DEAD), jnp.asarray(cone_2d(0.5)), TOL.eps_reg
     )
-    assert len(out) == 7
-    margin, f, r, viol, gap, converged, iters = out
+    # margin_core now appends the four KKT residuals after the raw flags.
+    assert len(out) == 11
+    (margin, f, r, viol, gap, converged, iters,
+     res_stat, res_eq, res_ineq, res_comp) = out
     # Recomputed residual margin is tiny for the balanced block.
     assert float(margin) <= TOL.tol_eq
     assert float(viol) <= TOL.tol_cone
     # r is the recomputed residual A f + w.
     assert np.allclose(np.asarray(r), np.asarray(A_BLOCK) @ np.asarray(f) + W_DEAD)
+    # The balanced block converges, so all four KKT residuals are tiny.
+    for res in (res_stat, res_eq, res_ineq, res_comp):
+        assert float(res) <= TOL.tol_gap
+    # res_ineq is the same cone violation the primal check reads.
+    assert abs(float(res_ineq) - float(viol)) <= 1e-12
 
 
 # --- verified verdicts ------------------------------------------------------
@@ -168,6 +182,112 @@ def test_exact_censored_lam_hi():
     assert r.status == FEASIBLE
     assert r.info.get("censored") is True
     assert abs(r.lambda_assoc - 0.5) < 1e-6
+    # A censored factor is a cap; unordered vs true even in 2D (finding 5b).
+    assert r.physical_bound_direction == "unknown"
+    assert r.info["bound"] == "censored-lower-of-assoc-unordered-vs-true"
+    # A censored optimum is not a physical collapse, so no mechanism is attached.
+    assert r.mechanism is None
+
+
+def test_exact_p2_mechanism_from_eqlin_marginals():
+    # At an uncensored P2 optimum the equality duals are the collapse
+    # mechanism (finding 2c). Topple-governed mu = 2: lambda* = 1.
+    r = solve_p2_exact(block(2.0), TOL, lam_hi=16.0)
+    assert r.status == FEASIBLE
+    assert abs(r.lambda_assoc - 1.0) < 1e-6
+    assert r.info.get("censored") is not True
+    assert r.mechanism is not None
+    assert np.all(np.isfinite(r.mechanism))
+    # Toppling: the rotation component dominates the translation.
+    vx, vz, wy = r.mechanism[0]
+    assert abs(wy) > 1e-6
+    # Complementary slackness is recorded and holds at the LP optimum.
+    assert "complementary_slackness" in r.info
+    assert r.info["complementary_slackness"] <= TOL.tol_dual
+    assert r.info["complementary_slackness_ok"] is True
+
+
+def test_exact_recompute_recorded_on_feasible():
+    # A HiGHS-feasible primal is accepted only after the recomputed residual
+    # and cone violation clear tol_eq / tol_cone (finding 2b).
+    r0 = solve_p0_exact(block(0.5), TOL)
+    assert r0.status == FEASIBLE
+    assert r0.info["recomputed_margin"] <= TOL.tol_eq
+    assert r0.info["recomputed_viol"] <= TOL.tol_cone
+    r2 = solve_p2_exact(block(0.3), TOL)
+    assert r2.status == FEASIBLE
+    assert r2.info["recomputed_margin"] <= TOL.tol_eq
+    assert r2.info["recomputed_viol"] <= TOL.tol_cone
+
+
+def test_exact_no_converge_when_farkas_fails(monkeypatch):
+    # HiGHS says infeasible but the Farkas certificate cannot validate: the
+    # verdict is NO_CONVERGE, not INFEASIBLE (finding 2a). Force the failure
+    # by patching the certificate to report uncertified.
+    import keystone.solve.exact as ex
+
+    def fake_cert(A, w, G, dim, tol):
+        return None, {"load_power": 0.0, "dual_residual": float("inf"),
+                      "certified": False}
+
+    monkeypatch.setattr(ex, "_farkas_certificate", fake_cert)
+    r0 = ex.solve_p0_exact(offset(), TOL)
+    assert r0.status == NO_CONVERGE
+    assert r0.info["farkas"]["certified"] is False
+    r2 = ex.solve_p2_exact(offset(), TOL)
+    assert r2.status == NO_CONVERGE
+    assert r2.info["farkas"]["certified"] is False
+
+
+def test_every_infeasible_result_carries_mechanism():
+    # Invariant (finding 2d): every INFEASIBLE Result from any solver has a
+    # mechanism. offset()/floating() collapse under dead load; A_OFFSET
+    # topples at every mu.
+    def g_of_mu(mu):
+        return jnp.asarray(cone_2d(mu), dtype=jnp.float64)
+
+    off = offset()
+    checks = [
+        ("solve_p0", solve_p0(off, TOL)),
+        ("solve_p0(floating)", solve_p0(floating(), TOL)),
+        ("solve_p4", solve_p4(off, TOL, lam=0.0)),
+        ("solve_p2", solve_p2(off, TOL)),
+        ("solve_p3", solve_p3(off, g_of_mu, TOL, mu_lo=0.0, mu_hi=4.0)),
+        ("solve_p0_exact", solve_p0_exact(off, TOL)),
+        ("solve_p2_exact", solve_p2_exact(off, TOL)),
+    ]
+    for name, r in checks:
+        assert r.status == INFEASIBLE, (name, r.status)
+        assert r.mechanism is not None, name
+        assert np.all(np.isfinite(r.mechanism)), name
+
+
+def test_margin_certified_full_kkt():
+    # margin_certified is the full KKT check (finding 3). A converged solve
+    # certifies with all four residuals below tol_gap; a two-iteration solve
+    # does not.
+    r = solve_p4(block(0.5), TOL)
+    assert r.info["margin_certified"] is True
+    kkt = r.info["kkt"]
+    for key in ("stationarity", "equality", "inequality", "complementarity"):
+        assert key in kkt
+        assert kkt[key] <= TOL.tol_gap
+    r2 = solve_p4(block(0.5), TOL, opts=SolverOptions(max_iter=2))
+    assert r2.info["margin_certified"] is False
+
+
+def test_resolve_verdict_uses_exact_forces(monkeypatch):
+    # A NO_CONVERGE QP that the exact oracle certifies feasible must return
+    # the oracle's recomputed-residual-checked forces, not the QP iterate
+    # (finding 1a). max_iter=2 forces the QP to NO_CONVERGE.
+    sys = block(0.5)
+    jitfn = _jit_margin(1e-9, 2)
+    status, v = _resolve_verdict(sys, sys.w_dead, TOL, jitfn, want_mechanism=False)
+    assert status == FEASIBLE
+    assert v.certified_by == "exact"
+    r = np.asarray(sys.A) @ np.asarray(v.f) + np.asarray(sys.w_dead)
+    denom = float(np.linalg.norm(np.asarray(sys.w_dead)))
+    assert float(np.linalg.norm(r) / denom) <= TOL.tol_eq
 
 
 # --- structured bound fields and rename -------------------------------------
@@ -182,11 +302,26 @@ def test_result_rename_and_bound_fields():
     assert r.constitutive_model == "associative"
 
 
-def test_bound_direction_linear2d():
-    r = solve_p0(block(0.5), TOL)
-    assert r.cone_model == "linear2d"
-    assert r.physical_bound_direction == "upper"
-    assert r.info["bound"] == "upper-of-true-assoc-exact"
+def test_bound_direction_p0_p4_none():
+    # P0 and P4 report no capacity factor, so physical_bound_direction is
+    # None (charter: a bound direction only accompanies a reported factor).
+    for r in (solve_p0(block(0.5), TOL), solve_p4(block(0.5), TOL)):
+        assert r.cone_model == "linear2d"
+        assert r.physical_bound_direction is None
+    # The exact P0 oracle agrees.
+    assert solve_p0_exact(block(0.5), TOL).physical_bound_direction is None
+
+
+def test_p2_p3_bound_helpers():
+    # P2: uncensored linear 2D overestimates true; pyramid and censored are
+    # unordered vs true.
+    assert _p2_bound("linear2d", False) == ("upper", "upper-of-true-assoc-exact")
+    assert _p2_bound("linear2d", True)[0] == "unknown"
+    assert _p2_bound("pyramid", False)[0] == "unknown"
+    assert _p2_bound("pyramid", True)[0] == "unknown"
+    # P3: linear 2D critical friction is a lower estimate; pyramid unordered.
+    assert _p3_bound("linear2d") == ("lower", "mu-lower-of-true")
+    assert _p3_bound("pyramid")[0] == "unknown"
 
 
 # --- input validation -------------------------------------------------------
@@ -219,6 +354,10 @@ def test_solver_options_validation():
         SolverOptions(max_iter=0)
     with pytest.raises(ValueError):
         SolverOptions(solver_tol=0.0)
+    with pytest.raises(ValueError):
+        SolverOptions(target_kappa=0.0)
+    # target_kappa default matches qpax's diff_qp default.
+    assert SolverOptions().target_kappa == 1e-3
 
 
 def test_cone_pyramid_k_validation():

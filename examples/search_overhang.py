@@ -1,11 +1,17 @@
 """Monte-Carlo tree search for maximum overhang, cube stacking on keystone.
 
+This is the slow reference baseline. It builds and assembles every child
+state on the host and calls the batched oracle one node at a time. The fast
+implementation, which keeps the whole frontier on the device, is
+examples/search_overhang_fast.py; use that for large runs.
+
 Measures how far pure PUCT search reaches on the maximum-overhang cube
-stacking problem, with no learning and an exact prefix-feasibility oracle.
-Every construction step must be statically feasible: after each cube is
-placed the whole assembly must satisfy the P4 elastic margin test
-(margin <= tol.tol_feas). Feasibility of all legal children of a node is
-decided in one batched qpax call.
+stacking problem, with no learning and a prefix-feasibility oracle. Every
+construction step must be statically feasible: after each cube is placed
+the whole assembly must satisfy the P4 elastic margin test
+(margin <= tol.tol_feas) AND the force state must be cone-certified, the
+same admission the batched kernel reports. Feasibility of all legal
+children of a node is decided in one batched qpax call.
 
 Ground truth anchor. The harmonic (simple) stack reaches an overhang of
 sum_{k=1..n} 1/(2k) block widths beyond the support edge. Counterweighted
@@ -217,8 +223,14 @@ class Search:
         return assemble(asm, self.tol, cone="linear2d")
 
     def _batch_margins(self, systems):
-        """Margins for a list of systems, using power-of-two padded batches."""
-        out = np.empty(len(systems), dtype=np.float64)
+        """Margins and certified flags for a list of systems.
+
+        Uses power-of-two padded batches. certified is margin_batch's
+        primal cone-admissibility flag; admission requires it (see
+        _evaluate).
+        """
+        out_m = np.empty(len(systems), dtype=np.float64)
+        out_c = np.empty(len(systems), dtype=bool)
         i = 0
         while i < len(systems):
             chunk = systems[i : i + CHUNK]
@@ -228,26 +240,31 @@ class Search:
             A_b = jnp.stack([s.A for s in sel])
             w_b = jnp.stack([s.w_dead for s in sel])
             G_b = jnp.stack([s.G for s in sel])
-            margins, _conv = margin_batch(
+            margins, certified = margin_batch(
                 A_b, w_b, G_b, self.tol.eps_reg, max_iter=self.search_iter
             )
             margins = np.asarray(margins)
-            out[i : i + c] = margins[:c]
+            certified = np.asarray(certified)
+            out_m[i : i + c] = margins[:c]
+            out_c[i : i + c] = certified[:c]
             i += CHUNK
-        return out
+        return out_m, out_c
 
     def _evaluate(self, child_keys):
         """Feasibility for a list of state keys, cache-aware and batched.
 
-        Returns a dict key -> margin. Feasible iff margin <= tol.tol_feas.
-        Only uncached states hit the solver.
+        Returns a dict key -> feasible bool. Feasible requires both
+        margin <= tol.tol_feas AND the cone-certified flag from the batched
+        kernel; a small margin on an uncertified force is not admitted. Only
+        uncached states hit the solver. Margins are kept in feas_cache for
+        reporting.
         """
         result = {}
         pending = []
         for key in child_keys:
             if key in self.feas_cache:
                 self.n_cache_hits += 1
-                result[key] = self.feas_cache[key][1]
+                result[key] = self.feas_cache[key][0]
             else:
                 pending.append(key)
         if pending:
@@ -255,13 +272,14 @@ class Search:
             systems = [self._system(key) for key in pending]
             self.t_host += time.perf_counter() - t0
             t0 = time.perf_counter()
-            margins = self._batch_margins(systems)
+            margins, certified = self._batch_margins(systems)
             self.t_solve += time.perf_counter() - t0
             self.n_qp += len(pending)
-            for key, mg in zip(pending, margins):
+            for key, mg, cert in zip(pending, margins, certified):
                 mg = float(mg)
-                self.feas_cache[key] = (mg <= self.tol.tol_feas, mg)
-                result[key] = mg
+                feasible = bool(mg <= self.tol.tol_feas and cert)
+                self.feas_cache[key] = (feasible, mg)
+                result[key] = feasible
         return result
 
     # --- expansion, selection, backup ------------------------------------
@@ -272,12 +290,12 @@ class Search:
         node["expanded"] = True
         legal = legal_actions(node["key"], self.dx, self.n)
         child_keys = {a: canonical(node["key"] + (a,)) for a in legal}
-        margins = self._evaluate(list(child_keys.values()))
+        feasible = self._evaluate(list(child_keys.values()))
 
         admissible = []
         for a in legal:
             ck = child_keys[a]
-            if margins[ck] <= self.tol.tol_feas:
+            if feasible[ck]:
                 admissible.append(a)
                 node["N_a"][a] = 0
                 node["W_a"][a] = 0.0
@@ -400,8 +418,8 @@ class Search:
                 if not legal:
                     break
                 keys = {a: canonical(placements + (a,)) for a in legal}
-                margins = self._evaluate(list(keys.values()))
-                adm = [a for a in legal if margins[keys[a]] <= self.tol.tol_feas]
+                feasible = self._evaluate(list(keys.values()))
+                adm = [a for a in legal if feasible[keys[a]]]
                 if not adm:
                     break
                 a = adm[int(self.rng.integers(len(adm)))]

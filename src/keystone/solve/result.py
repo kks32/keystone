@@ -16,6 +16,13 @@ prose. The associative relaxation is not, on its own, exact; a linear 2D
 cone overestimates true capacity, an inscribed pyramid is not ordered
 against it, and a critical friction is a lower estimate of the true
 requirement. Fields carrying associative quantities say so in their names.
+
+physical_bound_direction is populated only when a capacity factor is
+reported (lambda_assoc for P2, mu_critical_assoc for P3). P0 and P4 report
+no capacity factor, so they leave it None. A P3 inscribed pyramid and a
+censored P2 factor are unordered against true capacity, so both carry
+"unknown"; only a linear 2D uncensored P2 factor carries "upper" and only
+a linear 2D P3 critical friction carries "lower".
 """
 
 from dataclasses import dataclass, field
@@ -36,9 +43,14 @@ class Result:
     margin:  P4 elastic margin ||A f + w|| / ||w||, dimensionless,
              recomputed from the returned force by matvec (not read from
              the solver slack). Zero (below tol_eq) means equilibrated.
-             When the solve did not converge the margin is only an upper
-             bound on the optimal P4 margin; info["margin_certified"]
-             records whether the primal-dual gap certifies it optimal.
+             Bound on the optimum: a cone-admissible iterate (cone
+             violation <= tol_cone) is P4-feasible, so its margin is an
+             upper bound on the optimal P4 margin. An iterate that violates
+             the cone is not P4-feasible and its margin need not bound the
+             optimum in either direction. info["margin_certified"] is True
+             only when the full KKT residual (stationarity, equality,
+             inequality, complementarity) certifies the iterate optimal;
+             see batch_jax.margin_core.
     forces:  (nf,) newtons, layout of EquilibriumSystem, or None. For P2
              and P3 this is the force state on the certified-feasible side
              of the bracket.
@@ -52,13 +64,18 @@ class Result:
              normalized, or None.
     cone_model: the cone model used, "linear2d" | "pyramid" | "socp".
     constitutive_model: "associative" for every solver in this library.
-    physical_bound_direction: the reported factor relative to true Coulomb
-             capacity. "upper" for a linear 2D associative load factor
-             (overestimate of capacity). "unknown" for an inscribed
-             pyramid load factor (associative overestimate combined with a
-             cone underestimate; no ordering). "lower" for a critical
-             friction (mu_critical_assoc; true required friction can be
-             higher). None when no such factor is reported.
+    physical_bound_direction: the reported capacity factor relative to true
+             Coulomb capacity, or None when no capacity factor is reported.
+             "upper" for a linear 2D uncensored associative load factor
+             (overestimate of capacity). "unknown" for an inscribed pyramid
+             load factor (associative overestimate combined with a cone
+             underestimate; no ordering) and for a censored P2 factor (a
+             cap that lower-bounds associative capacity but is unordered vs
+             true even in 2D). "lower" for a linear 2D critical friction
+             (mu_critical_assoc; true required friction can be higher); a
+             pyramid critical friction is "unknown" for the same
+             cone-vs-associative reason. P0 and P4 report no capacity
+             factor and set None.
     trajectory: per-iteration record for P5, or None.
     info:    solver diagnostics (iterations, convergence flags, certificate
              summaries, bound tag).

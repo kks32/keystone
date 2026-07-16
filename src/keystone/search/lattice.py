@@ -49,6 +49,7 @@ import jax.numpy as jnp
 
 from ..mechanics.loads import DEFAULT_G
 from ..solve.batch_jax import margin_core
+from ..solve.pdhg import pdhg_margin
 
 # Frozen task constants. These describe the scene, not tolerances.
 PEDESTAL_W = 6.0
@@ -186,7 +187,10 @@ def empty_state(spec: LatticeSpec) -> State:
 
 def state_from_placements(spec: LatticeSpec, placements) -> State:
     """Build a State from a python iterable of (layer, xidx) pairs."""
+    placements = list(placements)
     n = spec.n_max
+    if len(placements) > n:
+        raise ValueError(f"{len(placements)} placements exceed n_max={n}")
     lay = jnp.zeros(n, dtype=jnp.int32)
     xid = jnp.zeros(n, dtype=jnp.int32)
     msk = jnp.zeros(n, dtype=bool)
@@ -194,7 +198,7 @@ def state_from_placements(spec: LatticeSpec, placements) -> State:
         lay = lay.at[i].set(int(L))
         xid = xid.at[i].set(int(j))
         msk = msk.at[i].set(True)
-    return State(lay, xid, msk, jnp.asarray(len(list(placements)), dtype=jnp.int32))
+    return State(lay, xid, msk, jnp.asarray(len(placements), dtype=jnp.int32))
 
 
 def place(spec: LatticeSpec, state: State, layer, xidx) -> State:
@@ -554,9 +558,11 @@ def _expand_jit(spec: LatticeSpec, ncand: int, solver_tol: float, max_iter: int)
         legal = is_legal(spec, state, cl, cx)
         ns = place(spec, state, cl, cx)
         A, w_dead, G, L, W = build_system(spec, ns)
-        margin, f, r, viol, gap, conv, iters = margin_core(
+        # margin_core returns (margin, f, r, viol, ...); slice the first
+        # four so appended diagnostics never break this consumer.
+        margin, f, r, viol = margin_core(
             A, w_dead, G, eps_reg, solver_tol=solver_tol, max_iter=max_iter
-        )
+        )[:4]
         cert = (viol <= tol_cone) & jnp.isfinite(margin)
         margin = jnp.where(legal, margin, jnp.inf)
         cert = jnp.where(legal, cert, False)
@@ -574,9 +580,11 @@ def _expand_batch_jit(spec: LatticeSpec, ncand: int, solver_tol: float, max_iter
         legal = is_legal(spec, state, cl, cx)
         ns = place(spec, state, cl, cx)
         A, w_dead, G, L, W = build_system(spec, ns)
-        margin, f, r, viol, gap, conv, iters = margin_core(
+        # margin_core returns (margin, f, r, viol, ...); slice the first
+        # four so appended diagnostics never break this consumer.
+        margin, f, r, viol = margin_core(
             A, w_dead, G, eps_reg, solver_tol=solver_tol, max_iter=max_iter
-        )
+        )[:4]
         cert = (viol <= tol_cone) & jnp.isfinite(margin)
         margin = jnp.where(legal, margin, jnp.inf)
         cert = jnp.where(legal, cert, False)
@@ -640,9 +648,11 @@ def _solve_states_jit(spec: LatticeSpec, B: int, solver_tol: float, max_iter: in
 
     def one(state, eps_reg, tol_cone):
         A, w_dead, G, L, W = build_system(spec, state)
-        margin, f, r, viol, gap, conv, iters = margin_core(
+        # margin_core returns (margin, f, r, viol, ...); slice the first
+        # four so appended diagnostics never break this consumer.
+        margin, f, r, viol = margin_core(
             A, w_dead, G, eps_reg, solver_tol=solver_tol, max_iter=max_iter
-        )
+        )[:4]
         cert = (viol <= tol_cone) & jnp.isfinite(margin)
         return margin, cert
 
@@ -661,6 +671,40 @@ def margins_of_states(
     b = int(states.count.shape[0])
     fn = _solve_states_jit(spec, b, float(solver_tol), int(max_iter))
     return fn(states, eps_reg, tol_cone)
+
+
+@functools.lru_cache(maxsize=None)
+def _solve_states_pdhg_jit(spec: LatticeSpec, B: int, iters: int, accel: bool):
+    """Cached jit of [build_system -> pdhg_margin] over a batch of B states.
+
+    Warm starts are passed as arrays (zeros for a cold start), so the trace
+    is uniform and jit caches on (spec, B, iters, accel) only.
+    """
+
+    def one(state, eps_reg, tol_cone, f0, y0):
+        A, w_dead, G, L, W = build_system(spec, state)
+        margin, f, y, viol = pdhg_margin(
+            A, w_dead, G, eps_reg, iters=iters, f0=f0, y0=y0, accel=accel
+        )
+        cert = (viol <= tol_cone) & jnp.isfinite(margin)
+        return margin, cert, f, y
+
+    return jax.jit(jax.vmap(one, in_axes=(0, None, None, 0, 0)))
+
+
+def margins_of_states_pdhg(
+    spec: LatticeSpec, states: State, eps_reg, tol_cone, *, iters, accel, f0, y0
+):
+    """First-order P4 screen margins and cert flags for a batch of states.
+
+    Mirrors margins_of_states but uses the pdhg screener and also returns
+    the final (f, y) iterates so descendants can warm start from them. f0
+    and y0 are (B, nf) and (B, ncone) warm starts; pass zeros for cold.
+    Returns (margins (B,), certified (B,), fs (B, nf), ys (B, ncone)).
+    """
+    b = int(states.count.shape[0])
+    fn = _solve_states_pdhg_jit(spec, b, int(iters), bool(accel))
+    return fn(states, eps_reg, tol_cone, f0, y0)
 
 
 def stack_states(states_list):

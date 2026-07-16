@@ -10,6 +10,14 @@ clipped with Sutherland-Hodgman to at most 8 vertices (arrives in C2).
 All functions take an explicit Tolerances argument. Geometric cuts use
 tolerances scaled by the caller-supplied L.
 
+Gap convention. g_tol is the maximum TOTAL face separation of a contact,
+measured as the distance between the two opposing faces. Ground contact
+measures a block face directly against z = 0 and accepts separations up to
+g_tol * L. Block-block contact measures each face-corner deviation from the
+mid-plane and accepts up to g_tol * L / 2, so the total separation (twice
+the mid-plane deviation for parallel faces) also stays within g_tol * L.
+Both paths therefore share one meaning of g_tol.
+
 A patch record is the tuple (i, j, normal(3,), t1(3,), verts(V, 3)):
 node ids i < j with ground = 0, n_hat pointing from i into j, t1 the
 2D or 3D tangent from the frame rule, and V world vertices ordered
@@ -26,6 +34,32 @@ _Z_HAT = np.array([0.0, 0.0, 1.0])
 # Frame selection threshold from CLAUDE.md Section 4. This picks the
 # reference axis for t1 and is a fixed convention, not a tolerance.
 _FRAME_AXIS_CUTOFF = 0.9
+
+
+def check_no_interpenetration(boxes, L: float, tol: Tolerances):
+    """Reject grossly interpenetrating boxes with a conservative AABB test.
+
+    For every pair, measure the overlap of the world axis-aligned bounding
+    boxes along each axis. When the overlap exceeds 2 * g_tol * L on every
+    axis at once, the boxes penetrate deeply, not merely touch, and a
+    ValueError names the pair. Contact penetration in the normal direction
+    is bounded by g_tol * L, so a legitimate tight contact leaves near-zero
+    overlap on the contact axis and is never flagged. This catches gross
+    modeling errors; it is not full collision rejection.
+    """
+    thresh = 2.0 * tol.g_tol * L
+    mins = [b.corners().min(axis=0) for b in boxes]
+    maxs = [b.corners().max(axis=0) for b in boxes]
+    n = len(boxes)
+    for i in range(n):
+        for j in range(i + 1, n):
+            overlap = np.minimum(maxs[i], maxs[j]) - np.maximum(mins[i], mins[j])
+            if bool(np.all(overlap > thresh)):
+                raise ValueError(
+                    f"boxes {i} and {j} interpenetrate: AABB overlap "
+                    f"{overlap.tolist()} exceeds 2 * g_tol * L = {thresh} on "
+                    f"every axis"
+                )
 
 
 def _t1_2d(n_hat: np.ndarray) -> np.ndarray:
@@ -175,8 +209,13 @@ def detect_patches_2d(boxes, ground: bool, L: float, tol: Tolerances):
     Each record: (i, j, normal(3,), t1(3,), verts(2, 3)) with i < j node
     ids, ground = node 0. n_hat points from i into j.
     """
+    check_no_interpenetration(boxes, L, tol)
     cos_theta = np.cos(tol.theta_tol)
     gap_max = tol.g_tol * L
+    # Block-block corner deviation is measured from the mid-plane, so the
+    # threshold is half the total-separation budget g_tol * L. Total
+    # separation then matches the ground path (see the module docstring).
+    gap_half = 0.5 * gap_max
     len_min = tol.A_min * L
     records = []
 
@@ -216,11 +255,12 @@ def detect_patches_2d(boxes, ground: bool, L: float, tol: Tolerances):
                     c_a = 0.5 * (a0 + a1)
                     c_b = 0.5 * (b0 + b1)
                     m = 0.5 * (c_a + c_b)
-                    # All four endpoints must lie within gap_max of the
-                    # mid-plane. The center gap alone lets edges tilted
+                    # All four endpoints must lie within gap_half of the
+                    # mid-plane, so the total separation stays within
+                    # g_tol * L. The center gap alone lets edges tilted
                     # within theta_tol pass with far corners.
                     ends = np.array([a0, a1, b0, b1])
-                    if float(np.max(np.abs((ends - m) @ n_a))) > gap_max:
+                    if float(np.max(np.abs((ends - m) @ n_a))) > gap_half:
                         continue
                     t = a1 - a0
                     t = t / np.linalg.norm(t)
@@ -250,8 +290,13 @@ def detect_patches_3d(boxes, ground: bool, L: float, tol: Tolerances):
     Each record: (i, j, normal(3,), t1(3,), verts(V, 3)) with V up to 8,
     ordered CCW about n_hat, i < j node ids, ground = node 0.
     """
+    check_no_interpenetration(boxes, L, tol)
     cos_theta = np.cos(tol.theta_tol)
     gap_max = tol.g_tol * L
+    # Block-block corner deviation is measured from the mid-plane, so the
+    # threshold is half the total-separation budget g_tol * L. Total
+    # separation then matches the ground path (see the module docstring).
+    gap_half = 0.5 * gap_max
     area_min = tol.A_min * L * L
     weld_dist = tol.w_tol * L
     records = []
@@ -292,13 +337,14 @@ def detect_patches_3d(boxes, ground: bool, L: float, tol: Tolerances):
                     if np.dot(n_a, n_b) >= -cos_theta:
                         continue
                     m = 0.5 * (c_a + c_b)
-                    # All corners of both faces must lie within gap_max of
-                    # the mid-plane. Checking the center gap alone lets
-                    # faces tilted within theta_tol flatten into a patch
-                    # while their corners sit far outside the gap.
+                    # All corners of both faces must lie within gap_half of
+                    # the mid-plane, so the total separation stays within
+                    # g_tol * L. Checking the center gap alone lets faces
+                    # tilted within theta_tol flatten into a patch while
+                    # their corners sit far outside the gap.
                     d_a = np.abs((corners_a - m) @ n_a)
                     d_b = np.abs((corners_b - m) @ n_a)
-                    if max(float(d_a.max()), float(d_b.max())) > gap_max:
+                    if max(float(d_a.max()), float(d_b.max())) > gap_half:
                         continue
                     n_hat = n_a
                     t1, t2 = _frame_3d(n_hat)

@@ -285,14 +285,18 @@ class TestDepthIndependence2D:
 
 class TestFaceGapAtCorners:
     """Face pairs must be close at every corner, not only at the center.
-    A face tilted within theta_tol can have a small center gap yet corners
-    far outside g_tol * L; those must not flatten into a patch."""
+    Block-block corner deviation from the mid-plane must stay below
+    g_tol * L / 2, so the total face separation stays within g_tol * L, the
+    same budget the ground path spends measuring against z = 0. A face
+    tilted within theta_tol can have a small center gap yet corners past
+    that budget; those must not flatten into a patch."""
 
     def slabs(self, tilt):
         # 4 x 4 x 1 slabs, half_extents [2, 2, 0.5]. Bottom axis-aligned,
         # top tilted about y by `tilt` and centered one unit above so the
         # two contact-face centers meet near z = 1 (center gap ~ 0). A tilt
-        # about y lifts the x = +-2 corners in z by 2 * sin(tilt).
+        # about y moves the x = +-2 corners in z by 2 * sin(tilt), lifting
+        # one edge and dipping the opposite edge by the same amount.
         half = np.array([2.0, 2.0, 0.5])
         bottom = Box(half, np.array([0.0, 0.0, 0.5]))
         q = np.array([np.cos(tilt / 2.0), 0.0, np.sin(tilt / 2.0), 0.0])
@@ -304,41 +308,50 @@ class TestFaceGapAtCorners:
         return float(np.linalg.norm(allc.max(axis=0) - allc.min(axis=0)))
 
     def test_small_tilt_detects_patch(self):
-        # tilt = theta_tol / 4. Corner deviation 2 * sin(tilt) ~ 5.0e-4 is
-        # below g_tol * L ~ 6.0e-4, so the patch is kept.
-        tilt = 0.25 * TOL.theta_tol
+        # tilt = theta_tol / 10. Corner deviation 2 * sin(tilt) ~ 2.0e-4 is
+        # below the halved budget g_tol * L / 2 ~ 3.0e-4, so the patch is
+        # kept. The dipped edge penetrates by only 2.0e-4, far under the
+        # 2 * g_tol * L interpenetration guard, so detection does not raise.
+        tilt = 0.10 * TOL.theta_tol
         boxes = self.slabs(tilt)
         L = self.scale(boxes)
-        gap_max = TOL.g_tol * L
+        gap_half = 0.5 * TOL.g_tol * L
         corner_dev = 2.0 * np.sin(tilt)
-        assert corner_dev < gap_max
+        assert corner_dev < gap_half
         recs = detect_patches_3d(boxes, False, L, TOL)
         assert len(recs) == 1
         assert (recs[0][0], recs[0][1]) == (1, 2)
 
     def test_within_orientation_but_corners_far_no_patch(self):
-        # tilt = theta_tol / 2 passes the orientation filter (relative
+        # tilt = 0.4 * theta_tol passes the orientation filter (relative
         # normal angle below theta_tol), but corner deviation 2 * sin(tilt)
-        # ~ 1.0e-3 exceeds g_tol * L ~ 6.0e-4. The old center-only gap check
-        # accepted this; the corner check rejects it.
-        tilt = 0.5 * TOL.theta_tol
+        # ~ 8.0e-4 exceeds the halved budget g_tol * L / 2 ~ 3.0e-4. The old
+        # center-only gap check accepted this; the corner check rejects it.
+        # The dip is 8.0e-4, still below the 2 * g_tol * L ~ 1.2e-3
+        # interpenetration guard, so the gap check is what rejects it.
+        tilt = 0.4 * TOL.theta_tol
         boxes = self.slabs(tilt)
         L = self.scale(boxes)
-        gap_max = TOL.g_tol * L
+        gap_half = 0.5 * TOL.g_tol * L
         corner_dev = 2.0 * np.sin(tilt)
-        assert tilt < TOL.theta_tol       # orientation filter passes
-        assert corner_dev > gap_max        # corner gap check rejects
+        assert tilt < TOL.theta_tol        # orientation filter passes
+        assert corner_dev > gap_half       # corner gap check rejects
+        assert corner_dev < 2.0 * TOL.g_tol * L  # below interpenetration guard
         recs = detect_patches_3d(boxes, False, L, TOL)
         assert recs == []
 
-    def test_large_tilt_no_patch(self):
-        # tilt = 2 * theta_tol fails both filters: the relative normal
-        # angle exceeds theta_tol and corner deviation far exceeds g_tol * L.
+    def test_large_tilt_interpenetrates(self):
+        # tilt = 2 * theta_tol fails the orientation filter, and with the
+        # face centers coincident the dipped edge sinks 2 * sin(tilt) ~ 4e-3
+        # into the bottom slab, past the 2 * g_tol * L ~ 1.2e-3
+        # interpenetration guard. Detection raises rather than silently
+        # returning no patch for an overlapping pair.
         tilt = 2.0 * TOL.theta_tol
         boxes = self.slabs(tilt)
         L = self.scale(boxes)
-        recs = detect_patches_3d(boxes, False, L, TOL)
-        assert recs == []
+        assert 2.0 * np.sin(tilt) > 2.0 * TOL.g_tol * L
+        with pytest.raises(ValueError, match="interpenetrate"):
+            detect_patches_3d(boxes, False, L, TOL)
 
 
 class TestDegenerateLengthScale:
@@ -387,3 +400,91 @@ class TestBoxValidation:
             Box(np.ones(3), np.array([0.0, np.inf, 0.0]))
         with pytest.raises(ValueError, match="position must be finite"):
             Box(np.ones(3), np.array([np.nan, 0.0, 0.0]))
+
+    def test_bad_half_extents_shape(self):
+        # A 2-vector cannot be a 3D half-extent.
+        with pytest.raises(ValueError, match=r"half_extents must have shape \(3,\)"):
+            Box(np.array([1.0, 1.0]), np.zeros(3))
+        with pytest.raises(ValueError, match=r"half_extents must have shape \(3,\)"):
+            Box(np.array([1.0, 1.0, 1.0, 1.0]), np.zeros(3))
+
+    def test_bad_position_shape(self):
+        with pytest.raises(ValueError, match=r"position must have shape \(3,\)"):
+            Box(np.ones(3), np.array([0.0, 0.0]))
+        with pytest.raises(ValueError, match=r"position must have shape \(3,\)"):
+            Box(np.ones(3), np.zeros((3, 1)))
+
+    def test_bad_quat_shape(self):
+        # A 3-element quaternion must be rejected at construction, not later
+        # when rotation unpacks four components. Note [1, 0, 0] has norm 1,
+        # so the norm check alone would let it through; the shape check
+        # catches it first.
+        with pytest.raises(ValueError, match=r"quat must have shape \(4,\)"):
+            Box(np.ones(3), np.zeros(3), quat=np.array([1.0, 0.0, 0.0]))
+        with pytest.raises(ValueError, match=r"quat must have shape \(4,\)"):
+            Box(np.ones(3), np.zeros(3), quat=np.array([1.0, 0.0, 0.0, 0.0, 0.0]))
+
+
+class TestInterpenetration:
+    """build_assembly's detection path rejects grossly overlapping boxes
+    with a conservative AABB test at 2 * g_tol * L per axis. Legitimate
+    contacts, whose overlap on the contact axis is near zero, pass."""
+
+    def test_coincident_cubes_raise(self):
+        c1 = cube(0, 0, 0.5)
+        c2 = cube(0, 0, 0.5)
+        with pytest.raises(ValueError, match="interpenetrate"):
+            detect_patches_3d([c1, c2], False, 2.0, TOL)
+        with pytest.raises(ValueError, match="interpenetrate"):
+            build_assembly([c1, c2], mu=0.5, tol=TOL, dim=3, ground=False)
+
+    def test_stacked_pair_ok(self):
+        # Faces touch, so the contact-axis overlap is zero. Not flagged.
+        c1 = cube(0, 0, 0.5)
+        c2 = cube(0, 0, 1.5)
+        recs = detect_patches_3d([c1, c2], False, 2.0, TOL)
+        assert len(recs) == 1
+
+    def test_offset_pair_ok(self):
+        # Offset horizontally and stacked: the z overlap is zero.
+        c1 = cube(0, 0, 0.5)
+        c2 = cube(0.3, 0, 1.5)
+        recs = detect_patches_3d([c1, c2], False, 2.0, TOL)
+        assert len(recs) == 1
+
+    def test_coincident_2d_blocks_raise(self):
+        b1 = box_2d(1.0, 1.0, 0.0, 0.5)
+        b2 = box_2d(1.0, 1.0, 0.0, 0.5)
+        with pytest.raises(ValueError, match="interpenetrate"):
+            detect_patches_2d([b1, b2], False, 2.0, TOL)
+
+
+class TestGapConvention2D:
+    """g_tol is the maximum TOTAL face separation. Two stacked 2D blocks
+    with a vertical gap detect a patch only while the gap stays within
+    g_tol * L, matching the ground path's direct g_tol * L budget."""
+
+    def build(self, gap):
+        b1 = box_2d(1.0, 1.0, 0.0, 0.5)
+        b2 = box_2d(1.0, 1.0, 0.0, 1.5 + gap)
+        allc = np.concatenate([b1.corners(), b2.corners()], axis=0)
+        allc[:, 1] = 0.0  # 2D scale ignores the out-of-plane depth
+        L = float(np.linalg.norm(allc.max(axis=0) - allc.min(axis=0)))
+        recs = detect_patches_2d([b1, b2], False, L, TOL)
+        return L, recs
+
+    def test_total_separation_just_below_budget_detects(self):
+        # The two faces sit `gap` apart, so `gap` is the total separation.
+        # Just below g_tol * L it is kept.
+        L0 = float(np.linalg.norm(np.array([1.0, 2.0])))  # sqrt(5), gap ~ 0
+        gap = 0.9 * TOL.g_tol * L0
+        L, recs = self.build(gap)
+        assert gap < TOL.g_tol * L        # inside the total-separation budget
+        assert len(recs) == 1
+
+    def test_total_separation_just_above_budget_rejects(self):
+        L0 = float(np.linalg.norm(np.array([1.0, 2.0])))
+        gap = 1.1 * TOL.g_tol * L0
+        L, recs = self.build(gap)
+        assert gap > TOL.g_tol * L        # past the total-separation budget
+        assert recs == []

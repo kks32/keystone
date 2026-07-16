@@ -101,20 +101,32 @@ $$\min_{f \in K, s}\ \tfrac12 \lVert s \rVert^2 + \tfrac{\epsilon}{2}\lVert f \r
   $\lambda_{nonassoc} \le \lambda_{assoc}$ asserted.
 
 Bound directions (reported as structured fields on `Result`). Every solver
-is associative. The reported factor relates to true Coulomb capacity as:
+is associative. `physical_bound_direction` is populated only when a capacity
+factor is reported: P2 sets it for `lambda_assoc`, P3 for
+`mu_critical_assoc`. P0 and P4 report no capacity factor and set it `None`.
+The reported factor relates to true Coulomb capacity as:
 
-- `linear2d` (2D, exact associative): `lambda_assoc` is an **upper**
-  estimate of true Coulomb capacity. Associative capacity bounds true
-  capacity from above (Section 6). `physical_bound_direction = "upper"`.
-- `pyramid` (inscribed $k$-gon): `lambda_assoc` is a **lower** bound of the
-  exact-associative capacity (the cone is inscribed, hence conservative)
+- P2 `linear2d` (2D, exact associative), uncensored: `lambda_assoc` is an
+  **upper** estimate of true Coulomb capacity. Associative capacity bounds
+  true capacity from above (Section 6). `physical_bound_direction = "upper"`.
+- P2 `pyramid` (inscribed $k$-gon): `lambda_assoc` is a **lower** bound of
+  the exact-associative capacity (the cone is inscribed, hence conservative)
   but has **no ordering** against true Coulomb capacity: an associative
   overestimate combines with a cone underestimate and the net sign is not
   fixed. `physical_bound_direction = "unknown"`.
-- `mu_critical_assoc` (P3): a **lower** estimate of the true required
-  friction. The associative relaxation can certify feasibility at a $\mu$
-  below what non-associative Coulomb friction needs, so the true critical
-  friction can be higher. `physical_bound_direction = "lower"`.
+- P2 **censored** (any cone): when $\lambda$ saturates $\lambda_{hi}$ while
+  still certified feasible, or when the hi endpoint is uncertified and the
+  reported factor is the last certified-feasible $\lambda$, the value is
+  only a **lower** bound on associative capacity. It is unordered vs true
+  even in 2D. `physical_bound_direction = "unknown"`.
+- P3 `linear2d` (`mu_critical_assoc`): a **lower** estimate of the true
+  required friction. The associative relaxation can certify feasibility at a
+  $\mu$ below what non-associative Coulomb friction needs, so the true
+  critical friction can be higher. `physical_bound_direction = "lower"`.
+- P3 `pyramid`: an inscribed pyramid needs **more** friction than exact
+  associative, and true Coulomb also needs **more** than exact associative,
+  so the two effects are unordered and the reported critical friction has no
+  fixed sign vs true. `physical_bound_direction = "unknown"`.
 
 ## 5. Analytic gates (2D, unit depth, gravity g)
 

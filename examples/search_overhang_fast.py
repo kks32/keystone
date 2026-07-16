@@ -103,6 +103,13 @@ def main():
     parser.add_argument("--search_iter", type=int, default=50,
                         help="qpax iteration cap for the search oracle "
                              "(conservative below 100; final check uses 100)")
+    parser.add_argument("--screener", choices=["qpax", "pdhg"], default="qpax",
+                        help="expansion feasibility screener. qpax (default) is "
+                             "the certified interior point; pdhg is the "
+                             "first-order screen with certified re-verification "
+                             "of best-overhang improvements")
+    parser.add_argument("--pdhg_iters", type=int, default=400,
+                        help="fixed pdhg iteration count (screener=pdhg only)")
     parser.add_argument("--out", default="out/search", help="output directory")
     args = parser.parse_args()
 
@@ -113,12 +120,14 @@ def main():
     search = Search(
         args.n, args.dx, tol, c_puct=args.cpuct, seed=args.seed,
         batch=args.batch, search_iter=args.search_iter,
+        screener=args.screener, pdhg_iters=args.pdhg_iters,
     )
 
     print(
         f"search-fast: n={args.n} sims={args.sims} dx=1/{round(1 / args.dx)} "
         f"c_puct={args.cpuct} batch(K)={args.batch} seed={args.seed} "
-        f"search_iter={args.search_iter}",
+        f"search_iter={args.search_iter} screener={args.screener}"
+        + (f" pdhg_iters={args.pdhg_iters}" if args.screener == "pdhg" else ""),
         flush=True,
     )
     print(f"harmonic baseline sum(1/2k) = {base:.6f} block widths", flush=True)
@@ -148,6 +157,9 @@ def main():
           f"(cache size {len(search.feas_cache)})")
     if search.n_qp > 0 and search.t_solve > 0:
         print(f"solver per qp        = {1000 * search.t_solve / search.n_qp:.2f} ms")
+    if args.screener == "pdhg":
+        print(f"certified re-verifies= {search.n_reverify} "
+              f"({search.t_reverify:.2f} s); best updates gated on these")
     print(search.tree_report(), flush=True)
 
     # Re-verify prefix feasibility of the best sequence on the host pipeline.
@@ -177,6 +189,8 @@ def main():
         "sims": search.sims_done,
         "seed": args.seed,
         "batch": args.batch,
+        "screener": args.screener,
+        "n_reverify": search.n_reverify,
         "best_overhang": best,
         "harmonic": base,
         "sequence": [

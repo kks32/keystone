@@ -19,6 +19,14 @@ certified is the margin_core meaning: cone-admissible and finite. The best
 overhang is tracked over every certified-feasible state the search visits,
 and the reported best sequence is re-verified with the host pipeline.
 
+screener="pdhg" swaps the expansion oracle for the first-order screen in
+keystone.solve.pdhg, warm started from each candidate's parent. Screened
+verdicts decide expansion admissibility only. Any state that would improve
+the best overhang is first re-verified with the certified qpax kernel
+(counted in n_reverify), so a screener false-feasible can never corrupt
+the best-overhang tracking. The final host-pipeline re-verification of the
+best sequence is unchanged. See docs/KNOWN_LIMITS.md, screening semantics.
+
 Determinism: one numpy Generator seeds the run, iteration order is fixed,
 and PUCT ties break by the first action in the sorted action list, so the
 same seed gives the same best overhang and sequence every time.
@@ -26,6 +34,7 @@ same seed gives the same best overhang and sequence every time.
 
 import math
 
+import jax.numpy as jnp
 import numpy as np
 
 from ..geometry.tolerances import Tolerances
@@ -51,6 +60,9 @@ class Search:
         batch=16,
         search_iter=50,
         opts: SolverOptions = SolverOptions(),
+        screener="qpax",
+        pdhg_iters=400,
+        pdhg_accel=True,
     ):
         self.n = n
         self.dx = dx
@@ -65,6 +77,26 @@ class Search:
         # re-verified with the default cap.
         self.search_iter = int(search_iter)
         self.solver_tol = opts.solver_tol
+
+        # Feasibility screener. "qpax" is the certified interior-point path
+        # and the default, so recorded behavior is unchanged. "pdhg" is the
+        # first-order screener: it decides expansion admissibility, warm
+        # starts each candidate from its parent, and never updates the best
+        # overhang without a certified qpax re-verification (see _expand_batch).
+        if screener not in ("qpax", "pdhg"):
+            raise ValueError(f"screener must be 'qpax' or 'pdhg', got {screener!r}")
+        self.screener = screener
+        self.pdhg_iters = int(pdhg_iters)
+        self.pdhg_accel = bool(pdhg_accel)
+        # Screened (f, y) iterates per state key, for warm starting children.
+        self.screened_f = {}
+        self.screened_y = {}
+        # Parent key per child key, so the pdhg frontier can warm start.
+        self._parent_of = {}
+        # Certified re-verifications of best-improving screened states.
+        self._cert_cache = {}
+        self.n_reverify = 0
+        self.t_reverify = 0.0
 
         self.spec = LT.LatticeSpec(n_max=n, dx=dx)
         cand_L, cand_J = LT.action_grid(self.spec)
@@ -125,11 +157,9 @@ class Search:
         """Feasibility for a list of child state keys, cache-aware and batched.
 
         Returns nothing; fills self.feas_cache. Only uncached states hit the
-        solver. States are built with numpy and solved by the jitted lattice
-        kernel over power-of-two padded chunks.
+        solver. The screener chooses the kernel: qpax is the certified
+        interior point, pdhg is the first-order screen with warm starts.
         """
-        import time
-
         pending = [k for k in child_keys if k not in self.feas_cache]
         # Dedupe while keeping order.
         seen = set()
@@ -137,6 +167,15 @@ class Search:
         if not pending:
             return
         self.n_qp += len(pending)
+        if self.screener == "pdhg":
+            self._solve_frontier_pdhg(pending)
+        else:
+            self._solve_frontier_qpax(pending)
+
+    def _solve_frontier_qpax(self, pending):
+        """Certified interior-point feasibility over power-of-two chunks."""
+        import time
+
         i = 0
         while i < len(pending):
             chunk = pending[i : i + CHUNK]
@@ -162,6 +201,111 @@ class Search:
                 feasible = (mg <= self.tol.tol_feas) and cf
                 self.feas_cache[k] = (feasible, mg, cf)
             i += CHUNK
+
+    def _solve_frontier_pdhg(self, pending):
+        """First-order screen over chunks, warm started from each parent.
+
+        Every candidate warm starts from its parent's screened (f, y),
+        padded with zeros when the parent has none (root or unscreened). The
+        final (f, y) of each child is stored for its own descendants. The
+        margin and cert are the same recomputed quantities as the certified
+        path, so the only change is the kernel.
+        """
+        import time
+
+        nf = self.spec.nf
+        ncone = self.spec.ncone
+        zero_f = np.zeros(nf)
+        zero_y = np.zeros(ncone)
+        i = 0
+        while i < len(pending):
+            chunk = pending[i : i + CHUNK]
+            c = len(chunk)
+            b = min(1 << (c - 1).bit_length(), CHUNK) if c > 1 else 1
+            padded = chunk + [chunk[-1]] * (b - c)
+            f0 = np.zeros((b, nf))
+            y0 = np.zeros((b, ncone))
+            for r, k in enumerate(padded):
+                parent = self._parent_of.get(k)
+                if parent is not None and parent in self.screened_f:
+                    f0[r] = self.screened_f[parent]
+                    y0[r] = self.screened_y[parent]
+            t0 = time.perf_counter()
+            states = LT.batch_states(self.spec, padded)
+            margins, cert, fs, ys = LT.margins_of_states_pdhg(
+                self.spec,
+                states,
+                self.tol.eps_reg,
+                self.tol.tol_cone,
+                iters=self.pdhg_iters,
+                accel=self.pdhg_accel,
+                f0=jnp.asarray(f0),
+                y0=jnp.asarray(y0),
+            )
+            margins = np.asarray(margins)
+            cert = np.asarray(cert)
+            fs = np.asarray(fs)
+            ys = np.asarray(ys)
+            self.t_solve += time.perf_counter() - t0
+            for j, (k, mg, cf) in enumerate(zip(chunk, margins[:c], cert[:c])):
+                mg = float(mg)
+                cf = bool(cf)
+                feasible = (mg <= self.tol.tol_feas) and cf
+                self.feas_cache[k] = (feasible, mg, cf)
+                self.screened_f[k] = fs[j]
+                self.screened_y[k] = ys[j]
+            i += CHUNK
+
+    def _certify_batch(self, keys):
+        """Certified qpax verdicts for a list of state keys, batched.
+
+        Fills self._cert_cache and counts every solved key in n_reverify.
+        Chunked and padded exactly like the qpax frontier solve so the
+        compiled shapes stay shared with that path.
+        """
+        import time
+
+        pending = [k for k in keys if k not in self._cert_cache]
+        seen = set()
+        pending = [k for k in pending if not (k in seen or seen.add(k))]
+        if not pending:
+            return
+        self.n_reverify += len(pending)
+        i = 0
+        while i < len(pending):
+            chunk = pending[i : i + CHUNK]
+            c = len(chunk)
+            b = min(1 << (c - 1).bit_length(), CHUNK) if c > 1 else 1
+            padded = chunk + [chunk[-1]] * (b - c)
+            t0 = time.perf_counter()
+            states = LT.batch_states(self.spec, padded)
+            margins, cert = LT.margins_of_states(
+                self.spec,
+                states,
+                self.tol.eps_reg,
+                self.tol.tol_cone,
+                solver_tol=self.solver_tol,
+                max_iter=self.search_iter,
+            )
+            margins = np.asarray(margins)
+            cert = np.asarray(cert)
+            self.t_reverify += time.perf_counter() - t0
+            for k, mg, cf in zip(chunk, margins[:c], cert[:c]):
+                self._cert_cache[k] = (float(mg) <= self.tol.tol_feas) and bool(cf)
+            i += CHUNK
+
+    def _certified_feasible(self, key):
+        """Certified qpax verdict for one state, cached per key.
+
+        The pdhg screener consults this before any best-overhang update, so
+        a screener error in either direction can only cost extra certified
+        solves, never a wrong best. Counted in n_reverify.
+        """
+        hit = self._cert_cache.get(key)
+        if hit is None:
+            self._certify_batch([key])
+            hit = self._cert_cache[key]
+        return hit
 
     # --- expansion --------------------------------------------------------
 
@@ -207,9 +351,31 @@ class Search:
             actions.sort()  # stable order for deterministic tie-breaking
             per_leaf_actions.append(actions)
             for a in actions:
-                all_children.append(self._child_key(node["key"], a))
+                ck = self._child_key(node["key"], a)
+                all_children.append(ck)
+                # First-seen parent, for pdhg warm starts. Transpositions can
+                # give several parents; any screened parent is a valid start.
+                self._parent_of.setdefault(ck, node["key"])
 
         self._solve_frontier(all_children)
+
+        # Under the pdhg screener, every child that could improve the best
+        # overhang gets a certified verdict before the best update, in one
+        # batched call. Both screen directions are re-verified: a screened
+        # FEASIBLE could be false (would corrupt the best), and a screened
+        # INFEASIBLE at the boundary could be a false prune of the very
+        # state the search is looking for. Admissibility stays screened.
+        if self.screener == "pdhg":
+            improving = []
+            for node, actions in zip(pending, per_leaf_actions):
+                for a in actions:
+                    ck = self._child_key(node["key"], a)
+                    if (
+                        LT.overhang(ck, self.dx) > self.best_overhang
+                        and ck not in self._cert_cache
+                    ):
+                        improving.append(ck)
+            self._certify_batch(improving)
 
         # Admissible children and best-overhang bookkeeping.
         for node, actions in zip(pending, per_leaf_actions):
@@ -221,8 +387,16 @@ class Search:
                     admissible.append(a)
                     node["N_a"][a] = 0
                     node["W_a"][a] = 0.0
-                    ov = LT.overhang(ck, self.dx)
-                    if ov > self.best_overhang:
+                ov = LT.overhang(ck, self.dx)
+                if ov > self.best_overhang:
+                    # The best update is gated on the certified verdict when
+                    # screening, on the (already certified) qpax verdict
+                    # otherwise.
+                    if self.screener == "pdhg":
+                        best_ok = self._certified_feasible(ck)
+                    else:
+                        best_ok = feasible
+                    if best_ok:
                         self.best_overhang = ov
                         self.best_key = ck
                         self.best_parent = node["key"]

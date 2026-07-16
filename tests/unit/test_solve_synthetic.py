@@ -27,6 +27,9 @@ from keystone.mechanics.assemble import EquilibriumSystem
 from keystone.solve import (
     FEASIBLE,
     INFEASIBLE,
+    NO_CONVERGE,
+    Result,
+    SolverOptions,
     margin_and_grad,
     margin_batch,
     solve_p0,
@@ -258,6 +261,143 @@ def test_random_lp_agreement():
             disagreements += 1
     assert excluded < 5
     assert disagreements == 0
+
+
+def g_of_mu_2d(mu):
+    return jnp.asarray(cone_2d(mu), dtype=jnp.float64)
+
+
+def test_p2_p3_escalation_forces_provenance():
+    # With max_iter=2 the interior point never converges, so every verdict is
+    # decided by the exact oracle and the returned forces are the oracle's
+    # (finding 1a). info["forces_certified_by"] names the deciding backend.
+    opts = SolverOptions(max_iter=2)
+    r2 = solve_p2(block_system(0.3), TOL, opts=opts)
+    assert r2.status == FEASIBLE
+    assert r2.info["forces_certified_by"] == "exact"
+    assert abs(r2.lambda_assoc - 0.3) < 1e-4
+
+    wd = W_DEAD + 0.2 * W_LIVE
+    sys = make_system(A_BLOCK, wd, W_LIVE, cone_2d(0.5), 0.5)
+    r3 = solve_p3(sys, g_of_mu_2d, TOL, opts=opts)
+    assert r3.status == FEASIBLE
+    assert r3.info["forces_certified_by"] == "exact"
+    assert abs(r3.mu_critical_assoc - 0.2) < 1e-3
+
+
+def test_p2_uncertified_band_recording(monkeypatch):
+    # Force the hi endpoint uncertified: max_iter = 2 stalls the QP, the QP
+    # Farkas check is suppressed so no midpoint self-certifies infeasible, and
+    # the patched oracle certifies only the dead-load state. solve_p2 must then
+    # report the last certified-feasible lambda (0) with an uncertified band,
+    # never lam = hi with uncertified forces (finding 1b).
+    import keystone.solve.batch_jax as bj
+
+    real_exact = bj.solve_p0_exact
+    dead = np.asarray(W_DEAD, dtype=float)
+
+    def fake_exact(system, tol):
+        if np.allclose(np.asarray(system.w_dead), dead):
+            return real_exact(system, tol)
+        return Result(status=NO_CONVERGE, margin=float("inf"))
+
+    monkeypatch.setattr(bj, "solve_p0_exact", fake_exact)
+    monkeypatch.setattr(
+        bj, "_verify_farkas",
+        lambda y, A, G, w, tol: {
+            "load_power": 0.0, "dual_residual": float("inf"), "certified": False
+        },
+    )
+    sys = block_system(0.3)
+    r = solve_p2(sys, TOL, lam_hi=16.0, opts=SolverOptions(max_iter=2))
+    assert r.status == FEASIBLE
+    assert r.lambda_assoc == 0.0
+    assert r.info.get("bracket_found") is False
+    lo_band, hi_band = r.info["uncertified_band"]
+    assert lo_band == 0.0 and hi_band == 16.0
+    # The reported factor is a certified-feasible lower value, unordered vs true.
+    assert r.physical_bound_direction == "unknown"
+    # The reported forces certify equilibrium at the dead-load state.
+    f_nd = np.asarray(r.forces) / float(sys.W)
+    resid = A_BLOCK @ f_nd + W_DEAD
+    assert np.linalg.norm(resid) / np.linalg.norm(W_DEAD) <= TOL.tol_eq
+
+
+def test_p3_no_converge_at_mu_hi_not_infeasible(monkeypatch):
+    # NO_CONVERGE at mu_hi must never be reported as INFEASIBLE (finding 1c).
+    # Patch the oracle to always fail and stall the QP with max_iter = 2.
+    import keystone.solve.batch_jax as bj
+
+    monkeypatch.setattr(
+        bj, "solve_p0_exact",
+        lambda system, tol: Result(status=NO_CONVERGE, margin=float("inf")),
+    )
+    r = solve_p3(block_system(0.5), g_of_mu_2d, TOL, opts=SolverOptions(max_iter=2))
+    assert r.status == NO_CONVERGE
+    assert r.info.get("uncertified_at_mu_lo") is True
+    assert r.mu_critical_assoc is None
+    assert r.physical_bound_direction is None
+
+
+def test_p3_feasible_at_mu_lo_uses_low_forces():
+    # Feasible even at mu_lo: the returned forces come from the low endpoint
+    # and are admissible for the reported low friction (finding 1c).
+    wd = W_DEAD + 0.1 * W_LIVE
+    sys = make_system(A_BLOCK, wd, W_LIVE, cone_2d(0.5), 0.5)
+    r = solve_p3(sys, g_of_mu_2d, TOL, mu_lo=0.15, mu_hi=4.0)
+    assert r.status == FEASIBLE
+    assert abs(r.mu_critical_assoc - 0.15) < 1e-12
+    f_nd = np.asarray(r.forces) / float(sys.W)
+    assert np.max(cone_2d(0.15) @ f_nd) <= TOL.tol_cone
+    assert np.linalg.norm(A_BLOCK @ f_nd + wd) / np.linalg.norm(wd) <= TOL.tol_eq
+
+
+def test_margin_and_grad_finite_difference():
+    # Central-difference check at a smooth infeasible point: mu = 0.2,
+    # lam = 0.5 (above lam* = 0.2). The gradient is taken at a relaxed KKT
+    # point; a target_kappa tighter than the qpax default sharpens it. At
+    # target_kappa = 1e-5 the measured relative error is ~3e-4, well below
+    # 1e-3; the qpax default 1e-3 gives ~2.4e-2 (recorded, not asserted).
+    A = jnp.asarray(A_BLOCK)
+    G = jnp.asarray(cone_2d(0.2))
+    w = jnp.asarray(W_DEAD + 0.5 * W_LIVE)
+    tk = 1e-5
+    value, grad = margin_and_grad(A, w, G, TOL.eps_reg, target_kappa=tk)
+    grad = np.asarray(grad)
+    assert np.isfinite(float(value)) and float(value) > TOL.tol_feas
+    assert np.all(np.isfinite(grad))
+
+    rng = np.random.default_rng(1)
+    rand = rng.standard_normal(3)
+    rand /= np.linalg.norm(rand)
+    base = float(np.linalg.norm(np.asarray(w)))
+    eps = 1e-5 * base
+    worst = 0.0
+    for d in (np.asarray(W_LIVE, dtype=float), rand):
+        mp, _ = margin_and_grad(
+            A, jnp.asarray(np.asarray(w) + eps * d), G, TOL.eps_reg, target_kappa=tk
+        )
+        mm, _ = margin_and_grad(
+            A, jnp.asarray(np.asarray(w) - eps * d), G, TOL.eps_reg, target_kappa=tk
+        )
+        fd = (float(mp) - float(mm)) / (2.0 * eps)
+        ana = float(grad @ d)
+        rel = abs(fd - ana) / max(abs(fd), 1e-12)
+        worst = max(worst, rel)
+    assert worst < 1e-3, worst
+
+
+def test_margin_and_grad_value_matches_solve_p4():
+    # margin_and_grad now reports the recomputed-residual margin, the same
+    # quantity solve_p4 reports, so the two agree on the converged iterate
+    # (finding 4).
+    A = jnp.asarray(A_BLOCK)
+    G = jnp.asarray(cone_2d(0.2))
+    w = jnp.asarray(W_DEAD + 0.5 * W_LIVE)
+    value, _ = margin_and_grad(A, w, G, TOL.eps_reg)
+    sys = make_system(A_BLOCK, W_DEAD, W_LIVE, cone_2d(0.2), 0.2)
+    r = solve_p4(sys, TOL, lam=0.5)
+    assert abs(float(value) - float(r.margin)) < 1e-6
 
 
 if __name__ == "__main__":
