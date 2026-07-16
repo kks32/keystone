@@ -66,6 +66,21 @@ Reaching a set prefix-feasibly by one order does not make every order
 feasible, and the closed list never claims that: it only asserts that one
 feasible arrival is enough to enumerate the set's future.
 
+The argument survives the placement-reachability modes. A drop or slide
+check reads the set of already-placed cubes and the candidate cell, never
+the order that built the set, so the legal children of a set are still a
+function of the set alone. One legal, prefix-feasible arrival at a set is
+therefore still enough to enumerate its future under any mode.
+
+Placement modes.
+
+placement selects the reachability rule of lattice.is_legal: "static"
+(no motion check, today's behavior), "drop" (clear vertical column above
+the target), "slide" (drop column or a lateral corridor at the target
+layer). Reachability only removes actions, so every completion under drop
+or slide is also a static completion and the admissible bound below is
+unchanged: it never undercounts what a restricted mode can reach.
+
 Certification.
 
 Expansion feasibility uses the certified qpax path (the lattice
@@ -139,11 +154,14 @@ class CertifyResult:
     certified True means best-first branch and bound closed the gap and the
     optimum is proven. False means a budget stopped the run and only the
     interval [lower, upper] is certified. optimum is the incumbent overhang
-    (the best host-certified structure found); it equals lower.
+    (the best host-certified structure found); it equals lower. placement
+    records the reachability mode the run enforced ("static", "drop", or
+    "slide"); the optimum is proven within that mode's legal orders.
     """
 
     n: int
     dx: float
+    placement: str
     certified: bool
     optimum: float
     lower: float
@@ -174,14 +192,16 @@ class Certifier:
         *,
         opts: SolverOptions = SolverOptions(),
         mu: float = LT.MU,
+        placement: str = "static",
     ):
         self.n = int(n)
         self.dx = float(dx)
         self.tol = tol
         self.opts = opts
         self.mu = float(mu)
+        self.placement = str(placement)
 
-        self.spec = LT.LatticeSpec(n_max=self.n, dx=self.dx)
+        self.spec = LT.LatticeSpec(n_max=self.n, dx=self.dx, mode=self.placement)
         self.x_hi = self.spec.x_hi
         cand_L, cand_J = LT.action_grid(self.spec)
         self.cand_L = cand_L
@@ -451,15 +471,23 @@ class Certifier:
                 certified = False
 
         # Host re-verify the reported optimum's build order one more time so
-        # the emitted record stands on the certified pipeline alone.
+        # the emitted record stands on the certified pipeline alone. Under a
+        # reachability mode, also re-check the build order step by step; the
+        # search only generates reachable orders, so this is a cross-check.
         host_verified = False
+        reach_verified = True
         trace = self.incumbent_trace
         if self.incumbent_seq:
             host_verified, trace = self.host_prefix_feasible(self.incumbent_seq)
+            reach_verified, _ = sequence_reachable(
+                self.n, self.dx, self.incumbent_seq, self.placement
+            )
+            host_verified = host_verified and reach_verified
 
         return CertifyResult(
             n=self.n,
             dx=self.dx,
+            placement=self.placement,
             certified=bool(certified),
             optimum=self.incumbent,
             lower=self.incumbent,
@@ -476,7 +504,25 @@ class Certifier:
             host_verifications=self.host_verifications,
             closed_size=len(closed),
             wall_time=wall,
+            info={"reach_verified": bool(reach_verified)},
         )
+
+
+def sequence_reachable(n: int, dx: float, sequence, placement: str):
+    """Re-check a build order step by step under a placement mode.
+
+    Replays the sequence through lattice.is_legal on a spec with the given
+    placement mode, evaluating each step against the state before it, which
+    is exactly how the search gated it. Returns (all_legal, flags) with one
+    bool per step. Used to verify archived optima in their recorded order.
+    """
+    spec = LT.LatticeSpec(n_max=int(n), dx=float(dx), mode=placement)
+    state = LT.empty_state(spec)
+    flags = []
+    for (L, j) in sequence:
+        flags.append(bool(LT.is_legal(spec, state, int(L), int(j))))
+        state = LT.place(spec, state, int(L), int(j))
+    return all(flags), flags
 
 
 def certify(
@@ -488,7 +534,8 @@ def certify(
     max_nodes=None,
     time_limit=None,
     progress=True,
+    placement: str = "static",
 ) -> CertifyResult:
     """Certify the grid optimum (or an interval) for n cubes at step dx."""
-    engine = Certifier(n, dx, tol, opts=opts)
+    engine = Certifier(n, dx, tol, opts=opts, placement=placement)
     return engine.run(max_nodes=max_nodes, time_limit=time_limit, progress=progress)

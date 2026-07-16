@@ -29,6 +29,7 @@ numpy permutation, and the adapters are pure functions of the current params.
 
 import functools
 import json
+import math
 import os
 from dataclasses import dataclass
 
@@ -51,6 +52,21 @@ MAX_LAYERS = 6
 # ever visited, a zero Q. It could then never be selected. The floor keeps
 # every legal action reachable.
 EPS_UNIFORM = 0.1
+
+# Fixed range for the margin head, in log10 of the certified P4 margin. The
+# search records margins in feas_cache; a small sweep on n = 4 saw log10
+# margins from about -11.7 (near equilibrium) to -1.9 (clearly infeasible),
+# so [-12, 0] brackets the observed range with headroom. The target maps this
+# window linearly onto [0, 1]: log10 == -12 -> 0, log10 == 0 -> 1. A floor of
+# 1e-12 inside the log keeps the transform finite when a margin is exactly 0.
+MARGIN_LOG_LO = -12.0
+MARGIN_LOG_HI = 0.0
+MARGIN_FLOOR = 1e-12
+
+# Default weight on the auxiliary margin loss in the combined objective. The
+# total is policy CE + value MSE + MARGIN_WEIGHT * margin MSE. Exposed as a
+# train argument; this is only the default.
+MARGIN_WEIGHT = 0.5
 
 # Known-good dx = 1/12 build orders from real uniform searches, kept as seed
 # imitation data. Provenance: out/search/run_n4_dx12.log and
@@ -143,11 +159,15 @@ def legal_masks(fs: FeatureSpec, keys, n: int) -> np.ndarray:
 
 
 class AZNet(nn.Module):
-    """Two-hidden-layer MLP with a policy head and a value head.
+    """Two-hidden-layer MLP with policy, value, and margin heads.
 
     The policy head emits logits over the full action grid; the caller masks
     them to the legal set. The value head is a sigmoid in [0, 1], matching the
-    search value scale where overhang == harmonic(n) maps near 0.5.
+    search value scale where overhang == harmonic(n) maps near 0.5. The margin
+    head is a third sigmoid output regressing the normalized log10 certified
+    margin (see MARGIN_LOG_LO / MARGIN_LOG_HI). It is an auxiliary supervision
+    signal only; the search never reads it, so adding it is backward compatible
+    with callers that unpack the first two outputs by position.
     """
 
     m: int
@@ -159,7 +179,8 @@ class AZNet(nn.Module):
         x = nn.relu(nn.Dense(self.hidden)(x))
         logits = nn.Dense(self.m)(x)
         value = nn.sigmoid(nn.Dense(1)(x))
-        return logits, value[..., 0]
+        margin = nn.sigmoid(nn.Dense(1)(x))
+        return logits, value[..., 0], margin[..., 0]
 
 
 class AZModel:
@@ -180,7 +201,11 @@ class AZModel:
         self._apply = jax.jit(lambda p, x: self.net.apply(p, x))
 
     def forward(self, feats: np.ndarray):
-        """Logits (B, M) and values (B,) for a batch of feature rows."""
+        """Logits (B, M), values (B,), and margins (B,) for a feature batch.
+
+        The third output is the normalized margin head. Callers that want only
+        priors or values index [0] or [1] and are unaffected by its presence.
+        """
         return self._apply(self.params, jnp.asarray(feats, dtype=jnp.float32))
 
 
@@ -240,7 +265,9 @@ class Sample:
 
     Exactly one of `taken` (imitation, an action index) and `pol` (self-play,
     an action-index -> probability map) is set. value is the target for the
-    value head.
+    value head. margin is the certified P4 margin of this state for the
+    auxiliary margin head, or None when no certified margin is known (imitation
+    prefixes are not solved by the search, so they carry no margin).
     """
 
     key: tuple
@@ -248,12 +275,44 @@ class Sample:
     taken: int
     pol: dict
     value: float
+    margin: float = None
 
 
 def _value_target(overhang_val: float, n: int) -> float:
-    """Final overhang normalized to [0, 1] by 2 * harmonic(n), then clipped."""
+    """Overhang normalized to [0, 1] by 2 * harmonic(n), then clipped."""
     v = overhang_val / (2.0 * harmonic(n))
     return float(min(max(v, 0.0), 1.0))
+
+
+def _margin_target(margin_val: float) -> float:
+    """Certified margin mapped to [0, 1] through normalized log10.
+
+    log10(margin + MARGIN_FLOOR) is placed on the fixed window
+    [MARGIN_LOG_LO, MARGIN_LOG_HI] and clipped. A near-zero margin (near
+    equilibrium) maps near 0; a large margin (clearly infeasible) maps near 1.
+    """
+    lm = math.log10(max(float(margin_val), 0.0) + MARGIN_FLOOR)
+    x = (lm - MARGIN_LOG_LO) / (MARGIN_LOG_HI - MARGIN_LOG_LO)
+    return float(min(max(x, 0.0), 1.0))
+
+
+def _suffix_max_overhangs(seq, dx):
+    """Suffix-max overhang for each prefix state along a build order.
+
+    seq is a list of (layer, xidx) placements. State s_k is the prefix with k
+    cubes placed, for k = 0..len(seq). Returns a list r of length len(seq)
+    where r[k] = max over j >= k of overhang(s_j), the best overhang reachable
+    from state s_k by continuing this order. Overhang is non-decreasing along a
+    build order, so this equals the final overhang here; it is computed as a
+    true suffix maximum so the target stays correct for any ordering.
+    """
+    ovs = [overhang(tuple(seq[:j]), dx) for j in range(len(seq) + 1)]
+    suffix = [float("-inf")] * (len(seq) + 1)
+    run = float("-inf")
+    for k in range(len(seq), -1, -1):
+        run = max(run, ovs[k])
+        suffix[k] = run
+    return suffix[: len(seq)]
 
 
 def _sequence_is_lattice_legal(fs: FeatureSpec, seq, n: int) -> bool:
@@ -292,27 +351,86 @@ def imitation_samples(fs: FeatureSpec, records):
         if not _sequence_is_lattice_legal(fs, seq, n):
             dropped += 1
             continue
-        ov = overhang(tuple(seq), fs.dx)
-        vt = _value_target(ov, n)
+        # Per-state value: the best overhang reachable from each prefix state,
+        # not one constant final value shared by the whole trajectory.
+        suffix = _suffix_max_overhangs(seq, fs.dx)
         for k in range(len(seq)):
             prefix = tuple(sorted(seq[:k]))
+            vt = _value_target(suffix[k], n)
             out.append(Sample(key=prefix, n=n, taken=action_index(fs, *seq[k]),
-                              pol=None, value=vt))
+                              pol=None, value=vt, margin=None))
     return out, dropped
 
 
-def selfplay_samples(fs: FeatureSpec, search) -> list:
+def _subtree_targets(search, robust: bool):
+    """Best reachable overhang per node, and whether its best path is knife-edge.
+
+    submax[key] is the maximum overhang over the node and all its descendants
+    in the search tree: the tree analog of a suffix-max, the best overhang
+    reachable from that state. knife[key] is True when the path from the node
+    down to that best descendant runs through a knife-edge state, a
+    certified-feasible state whose margin sits within a factor of ten of
+    tol_feas. knife is meaningful only when robust is True; otherwise it is all
+    False. Overhang is non-decreasing with depth, so submax is realized at a
+    deepest descendant and the recursion is a plain post-order maximum.
+    """
+    tree = search.tree
+    dx = search.dx
+    tol_feas = search.tol.tol_feas
+    knife_lo = tol_feas / 10.0
+
+    children = {}
+    for k, node in tree.items():
+        p = node["parent"]
+        if p is not None:
+            children.setdefault(p, []).append(k)
+
+    def self_knife(k):
+        if not robust:
+            return False
+        mg = search.margin_of(k)
+        # Knife-edge: certified feasible but within one order of tol_feas.
+        return mg is not None and knife_lo <= mg <= tol_feas
+
+    submax = {}
+    knife = {}
+
+    def visit(k):
+        best = overhang(k, dx)
+        best_knife = self_knife(k)
+        for c in children.get(k, ()):
+            cmax, cknife = visit(c)
+            if cmax > best:
+                best = cmax
+                best_knife = self_knife(k) or cknife
+        submax[k] = best
+        knife[k] = best_knife
+        return best, best_knife
+
+    visit(())
+    return submax, knife
+
+
+def selfplay_samples(fs: FeatureSpec, search, robust: bool = False,
+                     robust_penalty: float = 0.05) -> list:
     """Distillation rows from a finished search tree.
 
     For every expanded, non-terminal node with visits, the policy target is the
-    child visit distribution and the value target is the episode's best
-    overhang normalized. This is the standard MCTS-visit distillation target.
+    child visit distribution. The value target is the best overhang reachable
+    from that node, its subtree maximum, normalized. Each node then gets credit
+    for what its own subtree can achieve rather than one constant episode
+    return shared by the whole tree. The margin target is the node's certified
+    P4 margin, threaded from the search feasibility cache, for the auxiliary
+    margin head.
+
+    robust subtracts robust_penalty from the value target of any node whose
+    best path runs through a knife-edge state (see _subtree_targets). Default
+    off. robust_penalty is in normalized value units, about 0.1 block widths of
+    overhang at n = 4.
     """
     out = []
     n = search.n
-    vt = _value_target(
-        0.0 if search.best_overhang == float("-inf") else search.best_overhang, n
-    )
+    submax, knife = _subtree_targets(search, robust)
     for node in search.tree.values():
         if not node["expanded"] or node["terminal"]:
             continue
@@ -325,22 +443,34 @@ def selfplay_samples(fs: FeatureSpec, search) -> list:
         for a, v in zip(acts, visits):
             if v > 0:
                 pol[action_index(fs, *a)] = float(v / tot)
-        out.append(Sample(key=node["key"], n=n, taken=None, pol=pol, value=vt))
+        key = node["key"]
+        best_ov = submax.get(key, float("-inf"))
+        vt = _value_target(0.0 if best_ov == float("-inf") else best_ov, n)
+        if robust and knife.get(key, False):
+            vt = float(min(max(vt - robust_penalty, 0.0), 1.0))
+        out.append(Sample(key=key, n=n, taken=None, pol=pol, value=vt,
+                          margin=search.margin_of(key)))
     return out
 
 
 def assemble_arrays(fs: FeatureSpec, samples, smooth: float = 0.9):
-    """Stack samples into (feats, pols, vals, masks) arrays for training.
+    """Stack samples into arrays for training.
 
-    Legal masks are computed once per stack size. Imitation policy targets are
-    a smoothed one-hot: `smooth` on the taken action and the rest spread over
-    all legal actions. Self-play targets are the visit distribution as given.
+    Returns (feats, pols, vals, masks, margins, margin_mask). Legal masks are
+    computed once per stack size. Imitation policy targets are a smoothed
+    one-hot: `smooth` on the taken action and the rest spread over all legal
+    actions. Self-play targets are the visit distribution as given. margins is
+    the normalized margin target per row; margin_mask is True on rows that
+    carry a certified margin and False elsewhere, so the margin loss trains
+    only on states the search actually solved.
     """
     s = len(samples)
     feats = np.zeros((s, fs.F), dtype=np.float32)
     pols = np.zeros((s, fs.M), dtype=np.float32)
     vals = np.zeros((s,), dtype=np.float32)
     masks = np.zeros((s, fs.M), dtype=bool)
+    margins = np.zeros((s,), dtype=np.float32)
+    margin_mask = np.zeros((s,), dtype=bool)
 
     # Group row indices by stack size so legal masks batch per size.
     by_n = {}
@@ -355,6 +485,9 @@ def assemble_arrays(fs: FeatureSpec, samples, smooth: float = 0.9):
             feats[i] = encode_state(fs, smp.key, n)
             masks[i] = m[r]
             vals[i] = smp.value
+            if smp.margin is not None:
+                margins[i] = _margin_target(smp.margin)
+                margin_mask[i] = True
             if smp.pol is not None:
                 for idx, prob in smp.pol.items():
                     pols[i, idx] = prob
@@ -366,51 +499,71 @@ def assemble_arrays(fs: FeatureSpec, samples, smooth: float = 0.9):
             tot = pols[i].sum()
             if tot > 0:
                 pols[i] /= tot
-    return feats, pols, vals, masks
+    return feats, pols, vals, masks, margins, margin_mask
 
 
 # --- training loop ----------------------------------------------------------
 
 
-def _loss(net, params, f, p, v, m):
-    """Masked policy cross-entropy plus value mean squared error."""
-    logits, val = net.apply(params, f)
+def _loss(net, params, f, p, v, m, mg, mgm, margin_weight):
+    """Masked policy CE, value MSE, and weighted masked margin MSE.
+
+    mg is the normalized margin target and mgm is a 0/1 mask marking rows that
+    carry a certified margin. The margin term is a masked mean, so rows without
+    a margin contribute nothing and never bias the head. When no row in the
+    batch has a margin the term is zero.
+    """
+    logits, val, marg = net.apply(params, f)
     masked = jnp.where(m, logits, jnp.float32(-1e9))
     logp = jax.nn.log_softmax(masked, axis=-1)
-    pol_loss = -jnp.sum(p * logp, axis=-1)
-    val_loss = (val - v) ** 2
-    total = jnp.mean(pol_loss) + jnp.mean(val_loss)
-    return total, (jnp.mean(pol_loss), jnp.mean(val_loss))
+    pol_loss = jnp.mean(-jnp.sum(p * logp, axis=-1))
+    val_loss = jnp.mean((val - v) ** 2)
+    denom = jnp.maximum(jnp.sum(mgm), 1.0)
+    margin_loss = jnp.sum(mgm * (marg - mg) ** 2) / denom
+    total = pol_loss + val_loss + margin_weight * margin_loss
+    return total, (pol_loss, val_loss, margin_loss)
 
 
-def train(model: AZModel, feats, pols, vals, masks, steps: int,
-          batch: int = 256, lr: float = 3e-4, seed: int = 0):
+def train(model: AZModel, feats, pols, vals, masks, margins=None,
+          margin_mask=None, steps: int = 1000, batch: int = 256,
+          lr: float = 3e-4, margin_weight: float = MARGIN_WEIGHT,
+          seed: int = 0):
     """Train the model in place. Returns the loss history as a list of dicts.
 
     Adam at the given learning rate. Minibatches are a seeded permutation of
     the rows, cycled until `steps` updates run. Deterministic for a fixed seed
-    and dataset.
+    and dataset. margins and margin_mask default to no margin supervision;
+    passing them with margin_weight > 0 trains the auxiliary margin head. Each
+    history row records the policy, value, and margin components.
     """
     net = model.net
     opt = optax.adam(lr)
     opt_state = opt.init(model.params)
 
+    s = feats.shape[0]
+    if margins is None:
+        margins = np.zeros((s,), dtype=np.float32)
+    if margin_mask is None:
+        margin_mask = np.zeros((s,), dtype=bool)
+
     grad_fn = jax.jit(jax.value_and_grad(
         functools.partial(_loss, net), has_aux=True))
 
     @jax.jit
-    def step(params, opt_state, f, p, v, m):
-        (total, (pl, vl)), grads = grad_fn(params, f, p, v, m)
+    def step(params, opt_state, f, p, v, m, mg, mgm):
+        (total, (pl, vl, ml)), grads = grad_fn(
+            params, f, p, v, m, mg, mgm, jnp.float32(margin_weight))
         updates, opt_state = opt.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
-        return params, opt_state, total, pl, vl
+        return params, opt_state, total, pl, vl, ml
 
     fj = jnp.asarray(feats)
     pj = jnp.asarray(pols)
     vj = jnp.asarray(vals)
     mj = jnp.asarray(masks)
+    mgj = jnp.asarray(margins)
+    mgmj = jnp.asarray(margin_mask.astype(np.float32))
 
-    s = feats.shape[0]
     rng = np.random.default_rng(seed)
     order = rng.permutation(s)
     pos = 0
@@ -423,8 +576,8 @@ def train(model: AZModel, feats, pols, vals, masks, steps: int,
         sel = order[pos : pos + batch]
         pos += batch
         sj = jnp.asarray(sel)
-        params, opt_state, total, pl, vl = step(
-            params, opt_state, fj[sj], pj[sj], vj[sj], mj[sj]
+        params, opt_state, total, pl, vl, ml = step(
+            params, opt_state, fj[sj], pj[sj], vj[sj], mj[sj], mgj[sj], mgmj[sj]
         )
         if t == 0 or (t + 1) % 100 == 0 or t == steps - 1:
             history.append({
@@ -432,6 +585,7 @@ def train(model: AZModel, feats, pols, vals, masks, steps: int,
                 "loss": float(total),
                 "policy": float(pl),
                 "value": float(vl),
+                "margin": float(ml),
             })
     model.params = params
     return history

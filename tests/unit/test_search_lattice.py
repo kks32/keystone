@@ -7,8 +7,9 @@ margins agree to 1e-9, the active-patch masks agree exactly, and (A, w)
 agree to 1e-12 after aligning patches by (node pair, vertex positions).
 
 The rest of the file checks the legality rules against an independent
-reference, the fixed padded shapes, expand_kernel masking, and node-order
-invariance under placement order.
+reference, the placement-reachability modes (drop, slide) against a second
+independent reference, the fixed padded shapes, expand_kernel masking, and
+node-order invariance under placement order.
 """
 
 import numpy as np
@@ -16,6 +17,7 @@ import pytest
 
 from keystone import Tolerances, assemble, box_2d, build_assembly
 from keystone.solve.batch_jax import margin_batch, margin_core
+from keystone.search import bnb
 from keystone.search import lattice as LT
 
 TOL = Tolerances()
@@ -170,6 +172,30 @@ def ref_legal(spec, key, layer, xidx):
     return True
 
 
+def ref_reach(spec, key, layer, xidx, mode):
+    """Frozen reachability rules, plain python, independent of _reach_ok."""
+    dx = spec.dx
+    x = xidx * dx
+    if mode == "static":
+        return True
+    # Drop column: a cube strictly above the target blocks when its
+    # x-interval overlaps the target's with nonzero width (open overlap).
+    drop_clear = True
+    for (L, j) in key:
+        if L > layer:
+            px = j * dx
+            ov = min(x + 0.5, px + 0.5) - max(x - 0.5, px - 0.5)
+            if ov > 0.5 * dx:
+                drop_clear = False
+    if mode == "drop":
+        return drop_clear
+    # Slide corridors at the target layer only.
+    same = [j * dx for (L, j) in key if L == layer]
+    right_blocked = any(px - x > -1.0 + 0.5 * dx for px in same)
+    left_blocked = any(px - x < 1.0 - 0.5 * dx for px in same)
+    return drop_clear or (not right_blocked) or (not left_blocked)
+
+
 # =========================================================================
 # Agreement suite: the correctness gate.
 # =========================================================================
@@ -319,6 +345,131 @@ class TestLegality:
         # Internal sort makes the system independent of insertion order.
         assert np.max(np.abs(np.asarray(A1) - np.asarray(A2))) < 1e-14
         assert np.max(np.abs(np.asarray(w1) - np.asarray(w2))) < 1e-14
+
+
+# =========================================================================
+# Placement reachability (LatticeSpec.mode).
+# =========================================================================
+
+
+class TestReachability:
+    DX12 = 1.0 / 12.0
+    DX24 = 1.0 / 24.0
+
+    def test_default_mode_is_static(self):
+        assert LT.LatticeSpec(n_max=4).mode == "static"
+
+    def test_bad_mode_rejected(self):
+        with pytest.raises(ValueError, match="mode"):
+            LT.LatticeSpec(n_max=4, mode="teleport")
+
+    def test_matches_reference_under_modes(self):
+        # Full legality under drop and slide equals the independent python
+        # reference (static rules AND reachability) on random reachable
+        # states generated under the same mode.
+        for mode in ("drop", "slide"):
+            spec = LT.LatticeSpec(n_max=5, dx=self.DX12, mode=mode)
+            keys = random_reachable_states(spec, 40, seed=2)
+            cand_L, cand_J = LT.action_grid(spec)
+            cand_L_np = np.asarray(cand_L)
+            cand_J_np = np.asarray(cand_J)
+            for key in keys:
+                legal = np.asarray(
+                    LT.legal_grid(spec, LT.batch_states(spec, [key]),
+                                  cand_L, cand_J)
+                )[0]
+                ref = np.array(
+                    [ref_legal(spec, key, int(cand_L_np[i]), int(cand_J_np[i]))
+                     and ref_reach(spec, key, int(cand_L_np[i]),
+                                   int(cand_J_np[i]), mode)
+                     for i in range(cand_L_np.shape[0])]
+                )
+                assert np.array_equal(legal, ref), (mode, key)
+
+    def test_modes_only_remove_actions(self):
+        # drop-legal implies slide-legal implies static-legal, elementwise,
+        # on every tested state. Reachability is a pure restriction.
+        specs = {
+            m: LT.LatticeSpec(n_max=5, dx=self.DX12, mode=m)
+            for m in ("static", "slide", "drop")
+        }
+        keys = random_reachable_states(specs["static"], 40, seed=3)
+        cand = LT.action_grid(specs["static"])
+        for key in keys:
+            grids = {
+                m: np.asarray(
+                    LT.legal_grid(s, LT.batch_states(s, [key]), *cand)
+                )[0]
+                for m, s in specs.items()
+            }
+            assert not np.any(grids["drop"] & ~grids["slide"]), key
+            assert not np.any(grids["slide"] & ~grids["static"]), key
+
+    def test_drop_blocks_under_bridge_clamp(self):
+        # The certified static 31/24 clamp at n=4, dx=1/24 ends by sliding
+        # the reacher (1, 19) under the layer-2 bridge at (2, -4). That
+        # final placement must be illegal under drop and legal under slide.
+        prefix = [(0, -2), (1, -14), (2, -4)]
+        for mode, want in (("static", True), ("slide", True), ("drop", False)):
+            spec = LT.LatticeSpec(n_max=4, dx=self.DX24, mode=mode)
+            st = LT.state_from_placements(spec, prefix)
+            assert bool(LT.is_legal(spec, st, 1, 19)) is want, mode
+
+    def test_clamp_order_slide_legal_every_step(self):
+        # The full certified clamp build order passes the per-step
+        # reachability re-check under slide and fails only at the final
+        # under-bridge step under drop.
+        clamp = [(0, -2), (1, -14), (2, -4), (1, 19)]
+        ok, flags = bnb.sequence_reachable(4, self.DX24, clamp, "slide")
+        assert ok and flags == [True, True, True, True]
+        ok, flags = bnb.sequence_reachable(4, self.DX24, clamp, "drop")
+        assert not ok and flags == [True, True, True, False]
+
+    def test_reachability_depends_on_order(self):
+        # The same final set is drop-reachable when the reacher is placed
+        # before the bridge above it. Order matters; sets do not carry it.
+        reordered = [(0, -2), (1, 19), (1, -14), (2, -4)]
+        ok, flags = bnb.sequence_reachable(4, self.DX24, reordered, "drop")
+        assert ok and all(flags)
+
+    def test_slide_blocked_on_both_sides(self):
+        # Same-layer cubes left and right of the target plus a bridge over
+        # it: no drop column, no corridor, so slide is illegal while the
+        # static rules still accept the placement.
+        spec_by_mode = {
+            m: LT.LatticeSpec(n_max=6, dx=self.DX12, mode=m)
+            for m in ("static", "slide", "drop")
+        }
+        key = [(0, -30), (0, 0), (1, -24)]  # x = -2.5, 0.0, bridge at -2.0
+        for mode, want in (("static", True), ("slide", False), ("drop", False)):
+            spec = spec_by_mode[mode]
+            st = LT.state_from_placements(spec, key)
+            assert bool(LT.is_legal(spec, st, 0, -15)) is want, mode
+
+    def test_touching_column_does_not_block_drop(self):
+        # Open overlap: a cube above whose interval exactly touches the
+        # target's does not block the drop; one grid step closer does.
+        spec = LT.LatticeSpec(n_max=6, dx=self.DX12, mode="drop")
+        st = LT.state_from_placements(spec, [(0, -30), (1, -24)])
+        # Bridge spans [-2.5, -1.5]. Target (0, -12) spans [-1.5, -0.5].
+        assert bool(LT.is_legal(spec, st, 0, -12))
+        # Target (0, -13) spans [-1.5833, -0.5833]: overlap dx, blocked.
+        assert not bool(LT.is_legal(spec, st, 0, -13))
+
+    def test_legal_grid_matches_is_legal_under_drop(self):
+        # The batched grid and the scalar path agree under a mode.
+        spec = LT.LatticeSpec(n_max=4, dx=self.DX24, mode="drop")
+        key = ((0, -2), (1, -14), (2, -4))
+        cand_L, cand_J = LT.action_grid(spec)
+        grid = np.asarray(
+            LT.legal_grid(spec, LT.batch_states(spec, [key]), cand_L, cand_J)
+        )[0]
+        st = LT.state_from_placements(spec, key)
+        cand_L_np = np.asarray(cand_L)
+        cand_J_np = np.asarray(cand_J)
+        for i in range(0, cand_L_np.shape[0], 7):
+            one = bool(LT.is_legal(spec, st, int(cand_L_np[i]), int(cand_J_np[i])))
+            assert one == bool(grid[i])
 
 
 # =========================================================================

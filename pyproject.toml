@@ -20,6 +20,7 @@ dev = ["pytest>=8", "hypothesis>=6", "matplotlib>=3.8"]
 cuda12 = ["jax[cuda12]>=0.4.30"]
 cuda13 = ["jax[cuda13]>=0.6"]
 learn = ["optax>=0.2", "flax>=0.9"]
+mujoco = ["mujoco>=3.2"]
 
 [project.license]
 file = "LICENSE"

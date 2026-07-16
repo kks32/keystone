@@ -5,15 +5,22 @@ cube-stacking scene and reports either a certified grid optimum or an honest
 interval when a budget stops the search first. The optimum's build order is
 re-verified prefix by prefix on the host pipeline before it is emitted.
 
+--placement selects the reachability rule the search enforces per step:
+static (no motion check, the default), drop (clear vertical column above
+the target, a crane or top-grasp build), or slide (drop column or a clear
+lateral corridor at the target layer).
+
 Two JSON files are written. --out holds the full record of this run (node
 counts, wall time, the prefix margin trace). The accumulating optima file
 (--optima, default out/search/bnb_optima.json) keeps one simple record per
-(n, dx) for downstream learning: n, dx, optimum, certified, and the optimal
-build sequence.
+(n, dx, placement) for downstream learning: n, dx, placement, optimum,
+certified, and the optimal build sequence. A record without a placement
+field is a static run from before the field existed.
 
 Run:
   python examples/certify_overhang.py --n 4 --dx 1/12
   python examples/certify_overhang.py --n 4 --dx 1/24 --time-limit 1800
+  python examples/certify_overhang.py --n 4 --dx 1/12 --placement drop
 """
 
 import argparse
@@ -37,23 +44,34 @@ def seq_records(sequence, dx):
 
 
 def update_optima(path, res):
-    """Accumulate one optima record per (n, dx), replacing any stale match."""
+    """Accumulate one optima record per (n, dx, placement).
+
+    Replaces any stale record with the same key. A record with no
+    placement field predates the field and means placement "static".
+    """
     records = []
     if os.path.exists(path):
         with open(path) as f:
             records = json.load(f)
-    key = (res.n, dx_denom(res.dx))
-    records = [r for r in records if (r["n"], dx_denom(r["dx"])) != key]
+    key = (res.n, dx_denom(res.dx), res.placement)
+    records = [
+        r
+        for r in records
+        if (r["n"], dx_denom(r["dx"]), r.get("placement", "static")) != key
+    ]
     records.append(
         {
             "n": res.n,
             "dx": res.dx,
+            "placement": res.placement,
             "optimum": res.optimum,
             "certified": res.certified,
             "sequence": seq_records(res.sequence, res.dx),
         }
     )
-    records.sort(key=lambda r: (r["n"], dx_denom(r["dx"])))
+    records.sort(
+        key=lambda r: (r["n"], dx_denom(r["dx"]), r.get("placement", "static"))
+    )
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w") as f:
         json.dump(records, f, indent=1)
@@ -66,6 +84,9 @@ def main():
     parser.add_argument("--n", type=int, default=4, help="number of cubes")
     parser.add_argument("--dx", type=str, default="1/12",
                         help="grid step, float or fraction like 1/12")
+    parser.add_argument("--placement", choices=["static", "slide", "drop"],
+                        default="static",
+                        help="per-step reachability rule enforced by the search")
     parser.add_argument("--time-limit", type=float, default=None,
                         help="wall-clock budget in seconds")
     parser.add_argument("--max-nodes", type=int, default=None,
@@ -85,16 +106,18 @@ def main():
     opts = SolverOptions(solver_tol=args.solver_tol, max_iter=args.max_iter)
     base = LT.harmonic(args.n)
 
-    out = args.out or f"out/search/certify_n{args.n}_dx{den}.json"
+    tag = "" if args.placement == "static" else f"_{args.placement}"
+    out = args.out or f"out/search/certify_n{args.n}_dx{den}{tag}.json"
 
     print(
-        f"certify: n={args.n} dx=1/{den} time_limit={args.time_limit} "
-        f"max_nodes={args.max_nodes} max_iter={opts.max_iter}",
+        f"certify: n={args.n} dx=1/{den} placement={args.placement} "
+        f"time_limit={args.time_limit} max_nodes={args.max_nodes} "
+        f"max_iter={opts.max_iter}",
         flush=True,
     )
     print(f"harmonic(n) sum(1/2k) = {base:.6f} block widths", flush=True)
 
-    engine = bnb.Certifier(args.n, dx, tol, opts=opts)
+    engine = bnb.Certifier(args.n, dx, tol, opts=opts, placement=args.placement)
     res = engine.run(max_nodes=args.max_nodes, time_limit=args.time_limit)
 
     print("")
@@ -127,6 +150,7 @@ def main():
     record = {
         "n": res.n,
         "dx": res.dx,
+        "placement": res.placement,
         "certified": res.certified,
         "optimum": res.optimum,
         "lower": res.lower,

@@ -3,17 +3,41 @@
 Recorded gaps and sharp edges. Each entry states the limit, the impact, and the
 planned resolution. Dates are when the entry was recorded.
 
-## Prefix feasibility does not model placement kinematics (2026-07-15)
+## Prefix feasibility does not model placement kinematics (2026-07-15, updated 2026-07-16)
 
 Sequence feasibility certifies each intermediate block SET as a static
-equilibrium. The motion between configurations is not checked: a block may be
-"placed" into a pocket that a physical manipulator could only reach by sliding
-in from the side, or not at all. This became load-bearing with the certified
-n=4 clamp design (overhang 1.25), whose final cube slides in under an existing
-bridge. Impact: discovered sequences are statically buildable but may need a
-placement path check before robotic execution. Resolution: a reachability or
-sweep-collision check per placement (out of scope for the solver; belongs to
-the search layer or the robot planner).
+equilibrium. The motion between configurations is not checked by default: a
+block may be "placed" into a pocket that a physical manipulator could only
+reach by sliding in from the side, or not at all. This became load-bearing
+with the certified n=4 clamp design (overhang 1.25), whose final cube slides
+in under an existing bridge.
+
+Update: the lattice search now offers placement-reachability modes on
+`LatticeSpec.mode` and `--placement` in `examples/certify_overhang.py`.
+"static" is the default and checks nothing kinematic (bitwise the old
+behavior). "drop" requires a clear vertical column above the target cell at
+placement time (a crane or top-grasp build). "slide" accepts a clear column
+or a clear straight lateral corridor at the target layer, entered from either
+side past every placed cube. Reachability is evaluated against the state
+before each placement, so it depends on build order, not just the final set.
+
+What the modes model, and what they do not. Clearances are the exact unit
+gaps of the lattice: a layer-(L+1) bridge clears a layer-L slide by
+construction because layer heights are exact, and interval overlaps are open
+(touching faces do not block). Motions are single-axis and straight. No
+gripper, tool, or finger clearance is modeled; a physical end effector needs
+side or top room the lattice does not budget for. No swept-volume physics:
+the moving cube is assumed massless in transit and the structure is only
+checked statically before and after.
+
+Certified prices at n=4 (branch and bound,
+tests/analytic/test_bnb_optima.py): slide costs nothing, the 5/4 clamp build
+order is slide-legal at every step. Drop-only pins the optimum at exactly 1
+on both grids: price 1/4 block width against 5/4 static at dx=1/12 (two
+towers of two) and 7/24 against 31/24 at dx=1/24 (a four-high staircase). At
+n=3, dx=1/12 drop is free (5/6 either way). Resolution for real hardware: a
+sweep-collision check with end-effector geometry belongs to the robot
+planner, not this lattice.
 
 ## Two L definitions (2026-07-15, updated 2026-07-15)
 
@@ -166,3 +190,72 @@ an infeasible instance has no saddle point, its dual iterate grows without
 bound, and momentum on it compounds the growth geometrically (observed 1e5
 margin overshoot). With primal-only momentum the screened margin of an
 infeasible state stays finite and tracks the true residual infimum from above.
+
+## MuJoCo soft contacts topple knife-edge certified optima (2026-07-16)
+
+The certified overhang optima are exact limit states. Their P4 elastic margins
+are near machine zero (corbel c=0.98: 3e-11; clamp 31/24: 2e-11; n=6 4/3: 3e-11),
+which certifies static equilibrium but signals zero margin to perturbation.
+MuJoCo's default contact model is soft (solref time constant 0.02 s). Under it
+these structures topple in the 2 s settle test. The infeasible controls (corbel
+c=1.02, offset pair e=0.55, clamp at mu=0.3) also fall, so those agree.
+Stiffening the contacts (solref time constant toward 0.002 s) recovers stability
+in fragility order: corbel first, then n=6, then the clamp, which needs
+near-rigid contacts to stand (rotation 0.005 rad at solref 0.002). This is not a
+bug in either system. It is the model gap of PLAN.md Section 8.4 measured:
+associative limit analysis ranks capacity above MuJoCo's regularized, compliant
+model, and a zero-margin optimum has nothing to spend on compliance. keystone
+reports the exact verdict and is never tuned toward the simulator. Numbers:
+examples/mujoco_validate.py, out/mujoco/mujoco_validate.json. Downstream search
+that wants a dynamic safety margin should back off the reacher (next entry) or
+add a margin floor to the objective.
+
+## Default-softness settling reads as displacement on tall aligned stacks (2026-07-16)
+
+A 5-block aligned tower is certified feasible and physically stable, but at
+MuJoCo's default contact softness the settle test flags it unstable: the stack
+sags vertically 0.037 m (0.0072 L), just past the 0.005 L displacement band,
+while its rotation stays near zero (2e-4 rad). The signature (displacement
+exceeded, rotation near zero) separates compliance sag from a topple. The sag is
+soft-contact compression accumulating over stacked interfaces and vanishes under
+stiffer contacts (0.0072 L at default down to 5e-5 L at solref 0.002). The settle
+verdict is therefore contact-stiffness dependent near the band. The harness
+reports both the default-softness result and a stiffness sweep. Resolution: read
+the rotation channel alongside displacement, or run the sweep, when a stack fails
+on displacement alone.
+
+## Placement motions are obstructed for both reacher designs (2026-07-16)
+
+The first entry in this file records the lattice placement-reachability modes
+(static, drop, slide) added to the search layer. Those modes reason about clear
+columns and corridors with exact unit gaps and open interval overlaps, and they
+assume the moving cube is massless in transit. examples/mujoco_insert.py runs the
+missing swept-volume physics check in MuJoCo and finds both counterweighted
+reachers obstructed under rigid-body contact:
+
+- n=4 MCTS 7/6 reacher (drop path). This design was found under the static mode,
+  which checks nothing kinematic. The layer-2 counterweight overhangs the
+  reacher's target column by 1/12 of a block width, so the column is not clear. A
+  vertical drop starts 0.083 m inside that counterweight (measured as start-pose
+  contact penetration) and cannot seat the block. MuJoCo agrees with the stricter
+  lattice drop mode, which also rejects this placement: the "drop-legal" label
+  attached to 7/6 came from the permissive static search, not from a drop check.
+- n=4 clamp 31/24 reacher (slide path). The lattice slide mode accepts this
+  placement: the layer-2 bridge clears a layer-1 slide by construction because
+  layer heights are exact and touching faces do not block. Rigid-body physics does
+  not have that luxury. The bridge and the base cube form a slot exactly one block
+  high (bridge bottom z=3.0, base top z=2.0, reacher height 1.0). Sliding a unit
+  cube into a zero-clearance slot jams: peak contact force 1.4e7 N (about 700x a
+  block weight), the already-placed structure is shoved 0.19 m (0.023 L) during
+  the slide, and after release the structure collapses (2.0 m settle
+  displacement). The idealized slide is not executable quasi-statically at this
+  grid.
+
+The three counterweight drops in each design (base and both counterweights) place
+cleanly: structure displacement below 0.01 m, no disturbance. Impact: a sequence
+that passes the lattice reachability modes, is prefix-feasible, and even stands
+under stiff contacts can still be non-constructible because no collision-free
+rigid placement path exists for the reacher. The lattice modes are necessary but
+not sufficient; they need a swept-volume and end-effector check for real hardware.
+Resolution: that check belongs to the robot planner, or the grid needs sub-unit
+clearance; the solver certifies statics only. Numbers: out/mujoco/mujoco_insert.json.

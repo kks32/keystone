@@ -592,6 +592,17 @@ class Search:
 
     # --- reporting --------------------------------------------------------
 
+    def margin_of(self, key):
+        """Cached certified P4 margin for a state, or None if not solved.
+
+        The frontier solve stores (feasible, margin, certified) per child key
+        in feas_cache. A data collector reads margins from here to supervise a
+        margin head. Read-only; the search never depends on this method, and
+        the empty root has no cached margin (returns None).
+        """
+        hit = self.feas_cache.get(key)
+        return None if hit is None else hit[1]
+
     def history_of(self, key):
         """A prefix-feasible action order that builds the state at key."""
         seq = []

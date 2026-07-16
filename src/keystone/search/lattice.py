@@ -18,7 +18,10 @@ Scene (frozen, identical physics to the naive script):
   a layer-L (L >= 1) cube overlaps at least one layer-(L-1) cube by
   >= 2 dx; same-layer cubes are separated by more than one block width
   (no footprint overlap and no shared vertical face); in bounds; and the
-  layer is at most one above the current highest layer.
+  layer is at most one above the current highest layer. LatticeSpec.mode
+  can add a placement-reachability conjunct (drop column or slide
+  corridor, see _reach_ok); the default "static" keeps exactly the rules
+  above.
 
 Node ordering matches the naive script exactly. The host builds
 boxes_of(key) = [pedestal] + [cube per placement in sorted (L, j) order],
@@ -72,10 +75,18 @@ class LatticeSpec:
     All fields are python scalars, so a LatticeSpec is a static argument
     to the kernel: build_system reads n_max, dx, the pedestal geometry,
     and the derived paddings as compile-time constants.
+
+    mode selects the placement-reachability rule enforced by is_legal:
+    "static" (default) checks static-support legality only, "drop"
+    additionally requires a clear vertical column above the target, and
+    "slide" additionally requires either a clear column or a clear lateral
+    corridor at the target layer. mode is a compile-time constant, so the
+    "static" path traces the same graph as before this field existed.
     """
 
     n_max: int
     dx: float = DX
+    mode: str = "static"
     x_lo: float = X_LO
     x_hi: float = X_HI
     mu: float = MU
@@ -85,6 +96,12 @@ class LatticeSpec:
     ped_right: float = PED_RIGHT
     ped_cx: float = PEDESTAL_X
     ped_cz: float = PED_CZ
+
+    def __post_init__(self):
+        if self.mode not in ("static", "drop", "slide"):
+            raise ValueError(
+                f"mode must be 'static', 'drop', or 'slide', got {self.mode!r}"
+            )
 
     @property
     def j_lo(self) -> int:
@@ -486,12 +503,69 @@ def build_system(spec: LatticeSpec, state: State):
     return A, w_dead, G, L, W
 
 
+def _reach_ok(spec: LatticeSpec, state: State, layer, xidx):
+    """Placement reachability for modes "drop" and "slide". Pure JNP bool.
+
+    Reachability is evaluated against the state BEFORE the placement, so
+    the same final set can be reachable in one build order and not in
+    another. That order dependence is the point of these modes.
+
+    Drop: the vertical column above the target cell must be clear. A
+    placed cube at a layer strictly above the target blocks when its
+    x-interval overlaps the target's x-interval with nonzero width (open
+    overlap; touching edges do not block). The pedestal never blocks, it
+    sits below layer 0.
+
+    Slide: legal when the drop column is clear OR a lateral corridor
+    exists at the target layer, to the right or to the left. The moving
+    cube is one unit tall and slides at its own layer: layer heights are
+    exact, so a layer-(L+1) bridge clears it by construction and cubes
+    above or below the target layer never block a slide. A corridor is
+    blocked when any placed layer-L cube's interval meets, with nonzero
+    width, the interval the cube sweeps from the target out past every
+    placed extent on that side.
+
+    Modeling assumptions, recorded in KNOWN_LIMITS.md: clearances are the
+    exact unit-cell gaps of the lattice, straight-line axis-aligned
+    approach motions only, and no gripper or tool clearance is modeled.
+    """
+    dx = spec.dx
+    x = jnp.asarray(xidx, jnp.float64) * dx
+    layer = jnp.asarray(layer, jnp.int32)
+    px = state.placed_xidx.astype(jnp.float64) * dx
+    pl = state.placed_layer
+    msk = state.placed_mask
+
+    # Drop column. Overlaps on this grid are multiples of dx, so 0.5 dx
+    # separates touching (0) from a real overlap (>= dx).
+    ov = jnp.minimum(x + 0.5, px + 0.5) - jnp.maximum(x - 0.5, px - 0.5)
+    above = msk & (pl > layer)
+    drop_clear = ~jnp.any(above & (ov > 0.5 * dx))
+    if spec.mode == "drop":
+        return drop_clear
+
+    # Slide corridors at the target layer. Going right the cube sweeps
+    # (x - 0.5, +inf); a same-layer cube at px meets that sweep with
+    # nonzero width iff px - x > -1. Mirror for the left sweep.
+    same = msk & (pl == layer)
+    d = px - x
+    right_blocked = jnp.any(same & (d > -1.0 + 0.5 * dx))
+    left_blocked = jnp.any(same & (d < 1.0 - 0.5 * dx))
+    return drop_clear | ~right_blocked | ~left_blocked
+
+
 def is_legal(spec: LatticeSpec, state: State, layer, xidx):
     """Geometry-only legality of placing a cube at (layer, xidx).
 
     Pure JNP, returns a scalar bool. Mirrors the frozen legality rules:
     room, layer reachability, support overlap >= 2 dx, same-layer
     clearance greater than one block width, and in bounds.
+
+    spec.mode adds a placement-reachability conjunct: "drop" requires a
+    clear vertical column above the target, "slide" requires the column
+    or a lateral corridor at the target layer (see _reach_ok). The mode
+    is a compile-time constant; "static" (the default) skips the check
+    entirely, so the default trace is the pre-mode code path unchanged.
     """
     dx = spec.dx
     x = jnp.asarray(xidx, jnp.float64) * dx
@@ -521,7 +595,10 @@ def is_legal(spec: LatticeSpec, state: State, layer, xidx):
     clear_ok = jnp.min(gaps) > 1.0 + 0.5 * dx
 
     bounds_ok = (xidx >= spec.j_lo) & (xidx <= spec.j_hi)
-    return room & layer_ok & support_ok & clear_ok & bounds_ok
+    base = room & layer_ok & support_ok & clear_ok & bounds_ok
+    if spec.mode == "static":
+        return base
+    return base & _reach_ok(spec, state, layer, xidx)
 
 
 def expand_kernel(
