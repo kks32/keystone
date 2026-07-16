@@ -520,12 +520,13 @@ def render(tag, boxes, mu, out_dir):
         return f"render skipped ({type(e).__name__}: {e})"
 
 
-def _movie_camera(mujoco):
+def _movie_camera(mujoco, lookat=(0.0, 0.0, 2.0), distance=10.0,
+                  azimuth=90.0, elevation=-8.0):
     cam = mujoco.MjvCamera()
-    cam.lookat[:] = [0.0, 0.0, 2.0]
-    cam.distance = 10.0
-    cam.azimuth = 90.0
-    cam.elevation = -8.0
+    cam.lookat[:] = list(lookat)
+    cam.distance = distance
+    cam.azimuth = azimuth
+    cam.elevation = elevation
     return cam
 
 
@@ -545,7 +546,7 @@ def _static_frames(boxes, mu, n, renderer, cam, mujoco):
 
 
 def build_movie(name, eps, out_dir, footprint="full", height=300, width=420,
-                stride=140, fps=25):
+                stride=140, fps=25, camera=None, tag=""):
     """Render the whole hold-and-shim build to an animated GIF: the pre-reacher
     drops as growing-structure frames, then the live reacher slide, shim drive,
     and release-and-settle. Returns the GIF path or a reason string."""
@@ -562,7 +563,7 @@ def build_movie(name, eps, out_dir, footprint="full", height=300, width=420,
         renderer = mujoco.Renderer(mujoco.MjModel.from_xml_string(
             to_mjcf(pre_boxes + [short, shim], mu, solref=INSERT_SOLREF)),
             height=height, width=width)
-        cam = _movie_camera(mujoco)
+        cam = _movie_camera(mujoco, **(camera or {}))
 
         frames = []
         # Growing structure: pedestal, then each dropped block, as held frames.
@@ -595,7 +596,7 @@ def build_movie(name, eps, out_dir, footprint="full", height=300, width=420,
         if not frames:
             return "movie skipped (no frames captured)"
         imgs = [Image.fromarray(f) for f in frames]
-        path = os.path.join(out_dir, f"shim_movie_{name}_eps{eps}.gif")
+        path = os.path.join(out_dir, f"shim_movie_{name}{tag}_eps{eps}.gif")
         imgs[0].save(path, save_all=True, append_images=imgs[1:],
                      duration=int(1000 / fps), loop=0)
         return path

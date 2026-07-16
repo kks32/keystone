@@ -418,3 +418,104 @@ the structure stands after retraction (rotation 0.017 rad). Scope limits:
 
 Numbers, per-block table, and renders: out/mujoco/franka_build.json,
 franka_build.gif, franka_build.mp4.
+
+## Ride-under: the full-height reacher is its own insertion tool (2026-07-16)
+
+examples/mujoco_rideunder.py inserts the FULL-HEIGHT reacher of the clamp class
+with no props and no shim, replacing the two-handed hold-and-shim with a
+one-handed capped push. The reacher enters nose-first with a slight nose-down
+tilt; its leading top corner slips under the bridge lip, the bridge lifts, and
+leveling the reacher under the bridge lays the bridge back down. Geometry of the
+trick: a unit reacher tilted nose-down by theta, riding on its leading bottom
+corner at the base top, carries its leading top corner S*(1 - cos theta) below
+the lip, so any positive tilt clears it while a flat reacher sits exactly at the
+lip (the zero-clearance jam of the earlier entries).
+
+Scale, stated first. The maneuver runs at the Franka scale (cube side 0.05 m,
+0.25 kg) so push forces are robot-sized. keystone statics are scale-free (the P4
+margins below reproduce the unit-scale clamp), but the MuJoCo settle is not: the
+fixed solref time constant is relatively softer at the smaller scale. The
+pre-reacher stack (base, counterweight, bridge) certifies feasible (margin
+2.9e-12) and stands prop-free at every contact stiffness. The seated clamps all
+certify feasible but settle differently by scale: 26/24 stands at the Franka
+scale (rot 3e-4) and at unit scale; 29/24 stands at unit scale (rot 0.006) yet
+creep-topples at the Franka scale (rot 1.8); 31/24 topples at both. So the
+standing threshold in this simulator at the Franka scale is 26/24, one grid step
+below the falsework-standing 29/24 and five below the certified 31/24.
+
+Tilt table (29/24, drive cap 4 reacher weights, drive contacts solref 0.003).
+Every tilt slips the reacher under (reach error 0.2 to 0.5 mm), but tilt sets the
+force. A flat push rams: the reacher-bridge lift force is 5.8 N (about 2.4 bridge
+weights) and the ballast rotates 1.8 deg. Nose-down tilt turns the ram into a
+wedge; at 4 deg the lift force drops to 1.4 N and the ballast rotates 0.09 deg;
+8 deg is similar. 4 deg is the clean optimum.
+
+    tilt 0 deg: reacher-bridge lift 5.8 N, ballast rotation 1.82 deg
+    tilt 1 deg: lift 5.2 N, ballast rotation 1.77 deg
+    tilt 2 deg: lift 4.9 N, ballast rotation 1.72 deg
+    tilt 4 deg: lift 1.4 N, ballast rotation 0.09 deg
+    tilt 8 deg: lift 1.5 N, ballast rotation 0.13 deg
+
+Minimum push force and where it goes. At tilt 4 the peak driver push is 1.0 N
+(0.4 reacher weights) and the maneuver completes at every force cap down to the
+0.5-reacher-weight floor tested. Decomposition against the analytic edge-lift
+force for the 0.25 kg bridge (torque balance about the far support edge,
+0.5 * W_bridge = 1.23 N): the measured reacher-bridge vertical lift is 1.42 N
+(1.16 times the reference), and the 1.0 N push splits into a 0.09 N edge-lift
+horizontal share (F_v * tan 4 deg) and a 0.92 N friction-drag share (measured
+reacher-on-base drag 1.30 N). The push is mostly friction drag; the edge lift is
+cheap.
+
+Bridge return and per-design outcomes (tilt 4, cap 4).
+- 26/24: slips under, reach 0.44 mm, push 0.93 N, bridge returns to 1.6 mm,
+  clamp overlap 10.4 mm, ballast rotation 0.2 deg, seated P4 margin 1.4e-11, and
+  it STANDS (2 s and 6 s stiff settle). The clean full-height prop-free build.
+- 29/24: slips under just as cleanly, reach 0.42 mm, push 1.0 N, bridge returns
+  to 0.4 mm, overlap 5.3 mm, seated P4 margin 1.7e-11, but the seated knife-edge
+  creep-topples at the Franka scale (the scale effect above). Certified feasible;
+  stands at unit scale.
+- 31/24: the reacher seats under the driver (0.55 mm) but slides out on release
+  and comes to rest beside the bridge (overlap negative). The 1/24 thread is too
+  shallow to clamp; the released state is a shorter, stable, non-clamp rest.
+
+The bridge pivot is small, and that is a finding. A clean reseat lifts the bridge
+under 1 deg: only the reacher's low leading region passes under the bridge, its
+tall excess-span middle never reaches the lip, and progressive leveling lays the
+bridge back before it can walk. A large pivot appears only when the reseat fails
+(the fully tilted reacher, not leveled, drags the bridge off its seat). The
+user-facing visual is the tilted reacher sliding under, not a bridge flap.
+
+Intermediate arm-free certification (P4 margin versus push versus time, host
+pipeline, oriented 2D boxes with the y tilt). Frozen at snapshots, the
+reacher-held states read as external help needed: start and engagement are
+infeasible with margin 0.158 (the dangling reacher needs the hold), the tilted
+transient overlaps the bridge and trips the interpenetration guard (margin
+undefined), and the seated held state is feasible (margin 1.4e-11 for 26/24,
+1.7e-11 for 29/24). The help the state needs without the arm falls from 0.158 to
+near zero as the reacher seats.
+
+Phase 2, Franka execution: finger clearance passes, arm compliance is the
+blocker. The menagerie Franka picks the reacher and pushes it under the bridge
+(props retracted; the pre-stack stands prop-free). The clearance the maneuver
+needs is geometric and wide: the reacher is gripped near its trailing (+x) end,
+the bridge overlaps only the leading tail, so the pads sit 37.5 mm clear of the
+bridge (26/24) and the trailing end cantilevers 33 mm past the base over empty
+space. The sim confirms it: pad-bridge contact is 0.0 N through the whole run,
+and the carry (lift straight up, translate high, descend on the open side) leaves
+the bridge within 0.01 mm. But the push fails: the position-controlled arm,
+rigidly gripping the reacher, drags the bridge off its seat as it levels (bridge
+displaced 237 mm, ballast dropped 50 mm, structure collapses), where the Phase 1
+force-capped impedance driver reseated it to 1.6 mm. The ride-under needs the
+compliance of a capped push; stiff joint-position servos ram. Cartesian impedance
+or force control at the arm is the missing piece, not finger room.
+
+Verdict: ride-under makes the counterweighted clamp buildable prop-free and
+shim-free with a single capped push, and buildable-and-standing at the Franka
+scale at overhang 26/24 (n=4, dx=1/24), one grid step below the falsework 29/24
+and five below the statically certified 31/24. The 29/24 optimum inserts just as
+cleanly and is certified feasible, but its seated knife-edge is scale-marginal in
+MuJoCo (it stands at unit scale, creep-topples at the Franka scale). A real
+position-controlled arm clears the fingers by a wide margin yet rams the bridge:
+the open problem is arm compliance, not clearance. Numbers:
+out/mujoco/mujoco_rideunder.json; movie out/mujoco/rideunder_clamp_26_24.mp4 (and
+.gif); Franka attempt out/mujoco/rideunder_franka_14.mp4.
