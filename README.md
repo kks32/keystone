@@ -4,31 +4,8 @@ Static equilibrium for assemblies of rigid blocks with dry frictional joints.
 Given a stack of blocks, keystone answers four questions: can it stand, by what
 margin, how does it collapse, and how much extra load it takes before it does.
 The solvers run in JAX with fixed array shapes, so thousands of assemblies
-solve in one batched call and the P4 margin is differentiable with respect to
-the applied loads.
-
-## What works today
-
-The table separates what runs now from what is planned. Planned items have a
-milestone tag where one is set.
-
-| Capability | Status |
-| --- | --- |
-| P0 feasibility, verify or abstain, with a checked collapse mechanism | done |
-| P2 load factor by bisection | done |
-| P3 critical friction by bisection | done |
-| P4 elastic margin, batched and load-differentiable | done |
-| P5 non-associative bracket | planned |
-| 2D exact friction cone | done |
-| 3D inscribed pyramid cone | done |
-| 3D exact SOCP cone | planned |
-| Box-shaped blocks in 2D and 3D | done |
-| General triangle meshes | planned (M2) |
-| Vault and arch geometry | planned (M2) |
-| Lattice stacking search: batched MCTS, branch-and-bound optimality proofs, learned priors | done |
-| Lateral-reserve screen | done |
-| MuJoCo build execution and interop | done (examples) |
-| compas read and write interop | planned |
+solve in one batched call and the stability margin is differentiable with
+respect to the applied loads.
 
 ## Install
 
