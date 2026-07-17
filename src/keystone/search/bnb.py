@@ -212,6 +212,8 @@ class Certifier:
         densities=None,
         mu_ground=None,
         mu_by_slot=None,
+        robust: bool = False,
+        lam_min: float = LT.LAM_MIN,
     ):
         self.n = int(n)
         self.dx = float(dx)
@@ -219,6 +221,13 @@ class Certifier:
         self.opts = opts
         self.mu = float(mu)
         self.placement = str(placement)
+        # Reserve mode. When robust is set, the feasibility oracle certifies
+        # lam-robustness (P4 feasible under +-lam_min lateral load) instead of
+        # plain static feasibility. robust-feasible is a subset of feasible, so
+        # the admissible bound below is unchanged and stays valid. Off by
+        # default, so the static path traces exactly as before.
+        self.robust = bool(robust)
+        self.lam_min = float(lam_min)
         # Heterogeneous materials, one value per cube. densities and
         # mu_by_slot are indexed by sorted-cell position of the set, because
         # the search keys states on their canonical (sorted) placement set;
@@ -293,14 +302,25 @@ class Certifier:
             b = min(1 << (c - 1).bit_length(), CHUNK) if c > 1 else 1
             padded = chunk + [chunk[-1]] * (b - c)
             states = LT.batch_states(self.spec, padded)
-            margins, cert = LT.margins_of_states(
-                self.spec,
-                states,
-                self.tol.eps_reg,
-                self.tol.tol_cone,
-                solver_tol=self.opts.solver_tol,
-                max_iter=self.opts.max_iter,
-            )
+            if self.robust:
+                margins, cert = LT.robust_margins_of_states(
+                    self.spec,
+                    states,
+                    self.tol.eps_reg,
+                    self.tol.tol_cone,
+                    self.lam_min,
+                    solver_tol=self.opts.solver_tol,
+                    max_iter=self.opts.max_iter,
+                )
+            else:
+                margins, cert = LT.margins_of_states(
+                    self.spec,
+                    states,
+                    self.tol.eps_reg,
+                    self.tol.tol_cone,
+                    solver_tol=self.opts.solver_tol,
+                    max_iter=self.opts.max_iter,
+                )
             margins = np.asarray(margins)
             cert = np.asarray(cert)
             for k, mg, cf in zip(chunk, margins[:c], cert[:c]):
@@ -585,7 +605,11 @@ class Certifier:
             host_verifications=self.host_verifications,
             closed_size=len(closed),
             wall_time=wall,
-            info={"reach_verified": bool(reach_verified)},
+            info={
+                "reach_verified": bool(reach_verified),
+                "robust": self.robust,
+                "lam_min": self.lam_min if self.robust else None,
+            },
         )
 
 
@@ -620,6 +644,8 @@ def certify(
     densities=None,
     mu_ground=None,
     mu_by_slot=None,
+    robust: bool = False,
+    lam_min: float = LT.LAM_MIN,
 ) -> CertifyResult:
     """Certify the grid optimum (or an interval) for n cubes at step dx.
 
@@ -627,6 +653,12 @@ def certify(
     friction). densities and mu_by_slot are optional per-cube arrays of
     length n, indexed by sorted-cell position; mu_ground is the optional
     pedestal-ground friction. All default to the homogeneous scene.
+
+    robust switches the feasibility oracle to lam-robustness at lam_min: a
+    state counts feasible only when it certifies under +-lam_min lateral load.
+    The certified optimum is then the largest overhang with that lateral
+    reserve. The admissible bound is unchanged (robust-feasible is a subset of
+    feasible). Off by default.
     """
     engine = Certifier(
         n,
@@ -638,5 +670,7 @@ def certify(
         densities=densities,
         mu_ground=mu_ground,
         mu_by_slot=mu_by_slot,
+        robust=robust,
+        lam_min=lam_min,
     )
     return engine.run(max_nodes=max_nodes, time_limit=time_limit, progress=progress)

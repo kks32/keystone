@@ -253,6 +253,63 @@ examples/mujoco_validate.py, out/mujoco/mujoco_validate.json. Downstream search
 that wants a dynamic safety margin should back off the reacher (next entry) or
 add a margin floor to the objective.
 
+## Lam-reserve certification predicts compliant-physics survival (2026-07-17)
+
+Static feasibility alone does not predict whether a certified structure stands
+in compliant physics. Every feasible design has a near-zero P4 margin at zero
+load, so the margin at lam=0 cannot tell a knife edge from a design with reserve.
+The distinguishing quantity is the lateral reserve: the largest pseudo-static
+lateral load, as a fraction of self-weight, the structure carries while staying
+certified feasible. A state is "lam-robust" at lam_min when its P4 margin
+certifies feasible under both +lam_min and -lam_min lateral load; the symmetric
+reserve capacity is min(|lam+|, |lam-|), found by bisecting solve_p4 in each
+direction.
+
+Calibration against the MuJoCo settle outcomes (examples/mujoco_validate.py,
+out/mujoco/mujoco_validate.json, plus the pipeline stiff-contact driver runs),
+reserve capacity in fractions of g:
+
+    structure              reserve   physics
+    corbel c=0.98          0.0050    toppled
+    clamp 31/24 (j19)      0.0069    toppled
+    n6 17/12 pipeline      0.0069    collapsed
+    n6 4/3 (j10)           0.0088    toppled
+    clamp 5/4 n4 pipeline  0.0139    toppled (stiff-contact driver settle)
+    n6 back-1 5/4 (j9)     0.0175    stood
+    clamp 29/24 (j17)      0.0208    stood (unit scale; crept at 5 cm scale)
+    clamp 26/24 (j14)      0.0417    stood
+    pair e=0.45            0.1000    stood
+    tower 5-block          0.2000    stood
+
+The reserve capacity separates the sets cleanly: every structure that toppled
+sits at or below 0.0139, every structure that stood sits at or above 0.0175.
+The default threshold lam_min = 0.015 (keystone.search.lattice.LAM_MIN) sits
+inside that gap and classifies all ten calibration structures correctly. The
+nominal design default 0.02 separates the toppled set but conservatively flags
+the n6 back-1 design (reserve 0.0175, stood) as a knife edge; 0.01 misses the
+5/4 clamp of the n4 pipeline (reserve 0.0139, toppled). The two 5/4 designs
+bracket the boundary from both sides (the n4 clamp at 0.0139 toppled, the n6
+back-1 at 0.0175 stood), so the gap is tight and a run near it should be read
+as marginal. The calibration is a small hand set mixing two contact-stiffness
+regimes, so the threshold is a screening heuristic, not a physical guarantee:
+it predicts survival at the recorded MuJoCo settings, and a different contact
+model or scale (the 29/24 clamp stood at unit scale but crept at 5 cm) shifts
+the boundary. The pipeline reports predicted_physics ("stand" or "knife_edge")
+from this threshold and, with skip_predicted_fail set, skips the build of a
+predicted knife edge. The reserve-mode search (bnb robust, mcts lam_min)
+certifies designs with reserve at the cost of overhang. The certified price at
+n=4, dx=1/12: static 5/4; 7/6 at lam_min 0.01 to 0.05; 1 at lam_min 0.1
+(examples/robust_sweep.py, out/robust/reserve_sweep_n4.json).
+
+The reserve prediction covers the settled structure, not the build motion. The
+reserve MCTS at n=6 found a 5/4 design (lambda_assoc 0.026, predicted stand)
+whose as-designed structure settle-tests stable under stiff contacts at 2 s
+and 6 s, but whose driver execution failed at the under-bridge ride-under
+thread, the press-fit jam documented above (out/robust/pipeline_n6_seed0_
+robust.json and .mp4). A reserve-certified design can still be unbuildable by
+a given executor; pair the reserve mode with a placement mode (drop or
+slide_clear) when the build motion matters.
+
 ## Default-softness settling reads as displacement on tall aligned stacks (2026-07-16)
 
 A 5-block aligned tower is certified feasible and physically stable, but at

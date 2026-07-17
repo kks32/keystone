@@ -65,6 +65,7 @@ class Search:
         pdhg_accel=True,
         prior_fn=None,
         value_fn=None,
+        lam_min=None,
     ):
         self.n = n
         self.dx = dx
@@ -100,6 +101,15 @@ class Search:
         self.screener = screener
         self.pdhg_iters = int(pdhg_iters)
         self.pdhg_accel = bool(pdhg_accel)
+        # Reserve mode. lam_min not None makes feasibility mean lam-robustness
+        # (P4 feasible under +-lam_min lateral load), so both the frontier solve
+        # and the best-overhang re-verify certify reserve. It rides the
+        # certified qpax path only. None (the default) keeps the plain
+        # feasibility oracle and traces exactly as before.
+        self.robust = lam_min is not None
+        self.lam_min = None if lam_min is None else float(lam_min)
+        if self.robust and screener != "qpax":
+            raise ValueError("lam_min reserve mode requires screener='qpax'")
         # Screened (f, y) iterates per state key, for warm starting children.
         self.screened_f = {}
         self.screened_y = {}
@@ -207,14 +217,7 @@ class Search:
             padded = chunk + [chunk[-1]] * (b - c)
             t0 = time.perf_counter()
             states = LT.batch_states(self.spec, padded)
-            margins, cert = LT.margins_of_states(
-                self.spec,
-                states,
-                self.tol.eps_reg,
-                self.tol.tol_cone,
-                solver_tol=self.solver_tol,
-                max_iter=self.search_iter,
-            )
+            margins, cert = self._kernel_margins(states)
             margins = np.asarray(margins)
             cert = np.asarray(cert)
             self.t_solve += time.perf_counter() - t0
@@ -224,6 +227,32 @@ class Search:
                 feasible = (mg <= self.tol.tol_feas) and cf
                 self.feas_cache[k] = (feasible, mg, cf)
             i += CHUNK
+
+    def _kernel_margins(self, states):
+        """Certified margins and flags for a batch: reserve or plain feasibility.
+
+        In reserve mode this returns the two-sided lateral verdict, otherwise
+        the plain P4 verdict, both from the certified qpax kernel and both
+        tested by the identical margin <= tol_feas and cert rule downstream.
+        """
+        if self.robust:
+            return LT.robust_margins_of_states(
+                self.spec,
+                states,
+                self.tol.eps_reg,
+                self.tol.tol_cone,
+                self.lam_min,
+                solver_tol=self.solver_tol,
+                max_iter=self.search_iter,
+            )
+        return LT.margins_of_states(
+            self.spec,
+            states,
+            self.tol.eps_reg,
+            self.tol.tol_cone,
+            solver_tol=self.solver_tol,
+            max_iter=self.search_iter,
+        )
 
     def _solve_frontier_pdhg(self, pending):
         """First-order screen over chunks, warm started from each parent.
@@ -302,14 +331,7 @@ class Search:
             padded = chunk + [chunk[-1]] * (b - c)
             t0 = time.perf_counter()
             states = LT.batch_states(self.spec, padded)
-            margins, cert = LT.margins_of_states(
-                self.spec,
-                states,
-                self.tol.eps_reg,
-                self.tol.tol_cone,
-                solver_tol=self.solver_tol,
-                max_iter=self.search_iter,
-            )
+            margins, cert = self._kernel_margins(states)
             margins = np.asarray(margins)
             cert = np.asarray(cert)
             self.t_reverify += time.perf_counter() - t0

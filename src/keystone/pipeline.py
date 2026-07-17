@@ -40,6 +40,8 @@ from keystone import (
     box_2d,
     build_assembly,
     solve_p0,
+    solve_p2,
+    solve_p4,
 )
 from keystone.geometry.boxes import Box
 from keystone.interop.movies import FrameRecorder
@@ -149,37 +151,74 @@ def _run_search(n, dx, sims, seed, checkpoint, tol, progress=None):
 # --------------------------------------------------------------------------
 
 
-def certify_prefixes(seq, dx, tol, mu=MU):
-    """Replay each prefix through the host pipeline and solve P0.
+def certify_prefixes(seq, dx, tol, mu=MU, lam_min=None):
+    """Replay each prefix through the host pipeline and measure lateral reserve.
 
-    Returns a dict with per-step (layer, j, x, margin, status), the full-state
-    status and margin, prefix_feasible, and on a failure the failing step.
+    For every prefix: solve P0 (static feasibility) and, when feasible, solve
+    P4 under +-lam_min pseudo-static lateral load. A prefix is "robust" when
+    both directions certify feasible, the calibrated proxy for distance to
+    collapse. For the full structure, solve_p2 reports lambda_assoc, the exact
+    certified +x load factor.
+
+    Returns a dict with per-step (layer, j, x, margin, status, robust,
+    margin_plus, margin_minus), the full-state status and margin,
+    prefix_feasible, on a failure the failing step, the margins list, and the
+    reserve summary (lam_min, prefix_robust, full_robust, lambda_assoc).
+
+    lam_min defaults to the calibrated lattice.LAM_MIN.
     """
+    from keystone.search.lattice import LAM_MIN
+
+    if lam_min is None:
+        lam_min = LAM_MIN
+    lam_min = float(lam_min)
     steps = []
     placed = []
     prefix_feasible = True
     fail_step = None
+    full_system = None
     for (L, j) in seq:
         placed.append((L, j))
         boxes = [pedestal()] + [cube(pl, pj * dx) for (pl, pj) in placed]
         asm = build_assembly(boxes, mu=mu, tol=tol, dim=2)
         system = assemble(asm, tol, cone="linear2d")
         r = solve_p0(system, tol)
-        steps.append(
-            {
-                "n": len(placed),
-                "layer": int(L),
-                "j": int(j),
-                "x": float(j * dx),
-                "margin": float(r.margin),
-                "status": r.status,
-            }
-        )
+        step = {
+            "n": len(placed),
+            "layer": int(L),
+            "j": int(j),
+            "x": float(j * dx),
+            "margin": float(r.margin),
+            "status": r.status,
+        }
+        if r.status == FEASIBLE:
+            # Lateral reserve: P4 under +-lam_min lateral load. Both feasible
+            # means this prefix carries the calibrated reserve capacity.
+            rp = solve_p4(system, tol, lam=lam_min)
+            rm = solve_p4(system, tol, lam=-lam_min)
+            step["margin_plus"] = float(rp.margin)
+            step["margin_minus"] = float(rm.margin)
+            step["robust"] = bool(rp.status == FEASIBLE and rm.status == FEASIBLE)
+            full_system = system
+        else:
+            step["margin_plus"] = None
+            step["margin_minus"] = None
+            step["robust"] = False
+        steps.append(step)
         if r.status != FEASIBLE:
             prefix_feasible = False
             fail_step = len(placed) - 1
+            full_system = None
             break
     full = steps[-1] if steps else None
+    prefix_robust = bool(prefix_feasible and steps and all(s["robust"] for s in steps))
+    lambda_assoc = None
+    full_robust = None
+    if prefix_feasible and full_system is not None:
+        # Exact certified +x load factor of the full structure.
+        p2 = solve_p2(full_system, tol)
+        lambda_assoc = None if p2.lambda_assoc is None else float(p2.lambda_assoc)
+        full_robust = bool(steps[-1]["robust"])
     return {
         "steps": steps,
         "prefix_feasible": bool(prefix_feasible),
@@ -187,6 +226,10 @@ def certify_prefixes(seq, dx, tol, mu=MU):
         "full_margin": full["margin"] if full else None,
         "fail_step": fail_step,
         "margins": [s["margin"] for s in steps],
+        "lam_min": lam_min,
+        "prefix_robust": prefix_robust,
+        "full_robust": full_robust,
+        "lambda_assoc": lambda_assoc,
     }
 
 
@@ -1781,6 +1824,7 @@ def evaluate_stacking(
     progress=None,
     settle_duration=2.0,
     verbose=True,
+    skip_predicted_fail=False,
 ):
     """Evaluate a stacking design end to end and return the JSON record.
 
@@ -1795,6 +1839,12 @@ def evaluate_stacking(
     of build steps, forces those placements onto a transient falsework prop
     (retracted at the end), a build aid for a knife-edge cube whose prop-free
     drop is dynamically fragile; the certificate is unchanged.
+
+    CERTIFY reports the lateral reserve of every prefix and the full structure
+    and predicts the compliant-physics outcome (predicted_physics: "stand" or
+    "knife_edge") from the calibrated lam_min threshold. skip_predicted_fail
+    defaults False, so nothing changes silently; set it True to skip EXECUTE on
+    a predicted knife_edge (verdict "skipped_predicted_knife_edge").
     """
     tol = tol or Tolerances()
     os.makedirs(out_dir, exist_ok=True)
@@ -1870,6 +1920,13 @@ def evaluate_stacking(
             _print_summary(record_out)
         return record_out
 
+    # Reserve prediction from the calibrated threshold. The static certificate
+    # can hold at zero lateral reserve; predicted_physics maps the full
+    # structure's lam-robustness onto the compliant-physics outcome.
+    predicted_physics = "stand" if certify.get("full_robust") else "knife_edge"
+    record_out["predicted_physics"] = predicted_physics
+    record_out["lambda_assoc"] = certify.get("lambda_assoc")
+
     # Stage 3: plan.
     plan_blocks = classify_build(n, dx, seq)
     if prop_steps:
@@ -1890,6 +1947,34 @@ def evaluate_stacking(
     for b in plan_blocks:
         counts[b["protocol"]] += 1
     record_out["plan"] = {"blocks": plan_blocks, "protocol_counts": counts}
+
+    # Skip a predicted knife-edge build when asked. The static certificate
+    # holds but the lateral reserve is below lam_min, so compliant physics is
+    # predicted to fail; record the prediction and do not execute.
+    if skip_predicted_fail and predicted_physics == "knife_edge":
+        record_out["notes"].append(
+            "EXECUTE skipped: predicted knife_edge (lateral reserve below lam_min)"
+        )
+        execute = {
+            "executor": EXECUTOR if executor == "driver" else FRANKA_EXECUTOR,
+            "steps": [],
+            "verdict": "skipped_predicted_knife_edge",
+            "failed_protocol": None,
+            "failure_detail": "predicted knife_edge; execution skipped",
+            "settle": None,
+        }
+        record_out["execute"] = execute
+        record_out["agreement"] = {
+            "search_claim": search_claim,
+            "certificate": certificate,
+            "physics": None,
+            "predicted_physics": predicted_physics,
+            "three_way": "skipped_predicted_knife_edge",
+        }
+        _write_json(base + ".json", record_out)
+        if verbose:
+            _print_summary(record_out)
+        return record_out
 
     # Stage 4: execute (with the movie recorder across the whole build).
     if executor == "franka":
@@ -1944,6 +2029,7 @@ def evaluate_stacking(
         "search_claim": search_claim,
         "certificate": certificate,
         "physics": bool(physics),
+        "predicted_physics": predicted_physics,
         "three_way": three_way,
     }
 
@@ -1996,6 +2082,16 @@ def _print_summary(record):
             f"full_status={cert['full_status']} "
             f"margins[{rng[0]:.2e}, {rng[1]:.2e}]"
         )
+        if cert.get("lam_min") is not None:
+            la = cert.get("lambda_assoc")
+            la_s = f"{la:.4f}" if la is not None else "n/a"
+            pred = record.get("predicted_physics", "?")
+            print(
+                f"         reserve lam_min={cert['lam_min']:.4f} "
+                f"prefix_robust={cert.get('prefix_robust')} "
+                f"full_robust={cert.get('full_robust')} "
+                f"lambda_assoc={la_s} -> predicted_physics={pred}"
+            )
     plan = record.get("plan")
     if plan:
         protos = ", ".join(

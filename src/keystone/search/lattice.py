@@ -80,6 +80,17 @@ X_LO = -3.0
 X_HI = 4.0
 DX = 1.0 / 24.0
 
+# Lateral reserve threshold for "lam-robust" certification. A state is
+# lam-robust when its P4 margin certifies feasible under a pseudo-static
+# lateral load of +LAM_MIN and -LAM_MIN times self-weight (both directions).
+# The value is calibrated against MuJoCo compliant-physics outcomes: on the
+# validation set the symmetric reserve capacity min(|lam+|, |lam-|) separates
+# structures that stood from structures that toppled with a clean gap
+# (0.0139, 0.0175); 0.015 sits inside that gap and classifies every
+# calibration structure correctly. See docs/KNOWN_LIMITS.md, lam-reserve
+# calibration.
+LAM_MIN = 0.015
+
 
 @dataclass(frozen=True)
 class LatticeSpec:
@@ -852,6 +863,67 @@ def margins_of_states(
     b = int(states.count.shape[0])
     fn = _solve_states_jit(spec, b, float(solver_tol), int(max_iter))
     return fn(states, eps_reg, tol_cone)
+
+
+def _w_live_from_dead(w_dead):
+    """Unit +x lateral load from the -z dead load, 2D row layout [Fx, Fz, Ty].
+
+    build_system returns w_dead only. The lateral pseudo-static load puts each
+    block's weight on its Fx row; the same weight sits negated on the Fz dead
+    row. So the live vector is read straight off w_dead: weight_b = -w_dead[3b+1]
+    lands at w_live[3b+0]. This matches loads.dead_and_live_loads exactly.
+    """
+    weights = -w_dead[1::3]  # Fz rows carry -weight per block
+    w_live = jnp.zeros_like(w_dead)
+    return w_live.at[0::3].set(weights)  # Fx rows carry +weight
+
+
+@functools.lru_cache(maxsize=None)
+def _solve_states_robust_jit(spec: LatticeSpec, B: int, solver_tol: float,
+                             max_iter: int):
+    """Cached jit of the two-sided lateral solve over a batch of B states.
+
+    Solves P4 at w_dead + lam_min * w_live and at w_dead - lam_min * w_live.
+    Returns (worst_margin, robust_cert): worst_margin is the larger of the two
+    directional margins and robust_cert is the AND of the two cone-admissible
+    flags. A state is "lam-robust" exactly when worst_margin <= tol_feas and
+    robust_cert, so a caller reusing the plain feasible test gets the reserve
+    verdict with no other change.
+    """
+
+    def one(state, eps_reg, tol_cone, lam_min):
+        A, w_dead, G, L, W = build_system(spec, state)
+        w_live = _w_live_from_dead(w_dead)
+        mp, fp, rp, vp = margin_core(
+            A, w_dead + lam_min * w_live, G, eps_reg,
+            solver_tol=solver_tol, max_iter=max_iter,
+        )[:4]
+        mm, fm, rm, vm = margin_core(
+            A, w_dead - lam_min * w_live, G, eps_reg,
+            solver_tol=solver_tol, max_iter=max_iter,
+        )[:4]
+        cert_p = (vp <= tol_cone) & jnp.isfinite(mp)
+        cert_m = (vm <= tol_cone) & jnp.isfinite(mm)
+        return jnp.maximum(mp, mm), cert_p & cert_m
+
+    return jax.jit(jax.vmap(one, in_axes=(0, None, None, None)))
+
+
+def robust_margins_of_states(
+    spec: LatticeSpec, states: State, eps_reg, tol_cone, lam_min, *,
+    solver_tol, max_iter,
+):
+    """Two-sided lateral P4 margins and "lam-robust" flags for B states.
+
+    Mirrors margins_of_states but reports the worse of the +lam_min and
+    -lam_min directional margins and the AND of their certified flags. The
+    reserve verdict is worst_margin <= tol_feas and robust_cert, the identical
+    test the plain path uses, so a search swaps this kernel in without touching
+    its feasibility rule. Returns (margins (B,), certified (B,)).
+    """
+    b = int(states.count.shape[0])
+    fn = _solve_states_robust_jit(spec, b, float(solver_tol), int(max_iter))
+    return fn(states, eps_reg, tol_cone, lam_min)
 
 
 @functools.lru_cache(maxsize=None)

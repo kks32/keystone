@@ -672,6 +672,60 @@ class TestHeterogeneousAgreement:
         assert float(L0) == float(L1) and float(W0) == float(W1)
 
 
+class TestReserve:
+    """robust_margins_of_states: the two-sided lateral P4 reserve verdict.
+
+    The calibrated hand case at dx = 1/24: the 31/24 clamp optimum is a
+    zero-reserve knife edge that fails lam-robustness at LAM_MIN, while the
+    26/24 back-off passes. The kernel margin also equals two direct margin_core
+    solves at +-lam_min, and the plain kernel is untouched (reserve mode is a
+    strict tightening).
+    """
+
+    DX24 = 1.0 / 24.0
+    KNIFE = tuple(sorted([(0, -2), (1, -14), (2, -4), (1, 19)]))  # 31/24
+    STAND = tuple(sorted([(0, -2), (1, -14), (2, -4), (1, 14)]))  # 26/24
+
+    def test_knife_edge_fails_backed_off_passes(self):
+        spec = LT.LatticeSpec(n_max=4, dx=self.DX24)
+        states = LT.batch_states(spec, [self.KNIFE, self.STAND])
+        m, c = LT.robust_margins_of_states(
+            spec, states, TOL.eps_reg, TOL.tol_cone, LT.LAM_MIN,
+            solver_tol=SOLVER_TOL, max_iter=MAX_ITER,
+        )
+        m = np.asarray(m)
+        c = np.asarray(c)
+        feas = [(float(m[i]) <= TOL.tol_feas) and bool(c[i]) for i in range(2)]
+        assert feas == [False, True]
+
+    def test_matches_two_sided_margin_core(self):
+        spec = LT.LatticeSpec(n_max=4, dx=self.DX24)
+        state = LT.state_from_placements(spec, self.STAND)
+        A, w_dead, G, L, W = LT.build_system(spec, state)
+        w_live = LT._w_live_from_dead(w_dead)
+        lam = LT.LAM_MIN
+        mp = margin_core(A, w_dead + lam * w_live, G, TOL.eps_reg,
+                         solver_tol=SOLVER_TOL, max_iter=MAX_ITER)[0]
+        mm = margin_core(A, w_dead - lam * w_live, G, TOL.eps_reg,
+                         solver_tol=SOLVER_TOL, max_iter=MAX_ITER)[0]
+        m, c = LT.robust_margins_of_states(
+            spec, LT.batch_states(spec, [self.STAND]), TOL.eps_reg,
+            TOL.tol_cone, lam, solver_tol=SOLVER_TOL, max_iter=MAX_ITER,
+        )
+        assert abs(float(np.asarray(m)[0]) - max(float(mp), float(mm))) < 1e-9
+
+    def test_plain_kernel_still_calls_knife_edge_feasible(self):
+        # The plain path is unchanged: the 31/24 knife edge is statically
+        # feasible there, so reserve mode strictly tightens the verdict.
+        spec = LT.LatticeSpec(n_max=4, dx=self.DX24)
+        m, c = LT.margins_of_states(
+            spec, LT.batch_states(spec, [self.KNIFE]), TOL.eps_reg,
+            TOL.tol_cone, solver_tol=SOLVER_TOL, max_iter=MAX_ITER,
+        )
+        feas = (float(np.asarray(m)[0]) <= TOL.tol_feas) and bool(np.asarray(c)[0])
+        assert feas is True
+
+
 class TestBallastDirection:
     """Hand-check: heavier ballast raises the P4 feasibility of a reacher.
 

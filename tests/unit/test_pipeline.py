@@ -13,7 +13,15 @@ import os
 import numpy as np
 import pytest
 
-from keystone.pipeline import classify_build, evaluate_stacking
+from keystone import Tolerances
+from keystone.pipeline import certify_prefixes, classify_build, evaluate_stacking
+
+# Calibrated clamp cases at dx = 1/24 (test_bnb_optima geometry). The 31/24
+# optimum is a zero-reserve knife edge; backing the reacher off to 26/24 buys
+# lateral reserve above the calibrated threshold. Physics outcomes recorded in
+# out/mujoco/mujoco_validate.json: 31/24 topples, backed-off variants stand.
+KNIFE_SEQ = [(0, -2), (1, -14), (2, -4), (1, 19)]   # 31/24, toppled
+STAND_SEQ = [(0, -2), (1, -14), (2, -4), (1, 14)]   # 26/24, stood
 
 
 # --------------------------------------------------------------------------
@@ -66,6 +74,70 @@ def test_classify_prop():
     assert prop["retract_disp"] < 0.0
     assert prop["supports_step"] == 4
     assert boxed["params"]["com_side"] in ("+x", "-x")
+
+
+# --------------------------------------------------------------------------
+# Stage 2 reserve: lam-robust prefix flags, lambda_assoc, predicted_physics.
+# --------------------------------------------------------------------------
+
+
+def test_certify_prefixes_reserve_fields():
+    # The reserve summary and per-step reserve fields are present, and lam_min
+    # is the calibrated default.
+    from keystone.search.lattice import LAM_MIN
+
+    c = certify_prefixes(KNIFE_SEQ, 1.0 / 24.0, Tolerances())
+    for key in ("lam_min", "prefix_robust", "full_robust", "lambda_assoc"):
+        assert key in c
+    assert abs(c["lam_min"] - LAM_MIN) < 1e-12
+    for s in c["steps"]:
+        for key in ("robust", "margin_plus", "margin_minus"):
+            assert key in s
+
+
+def test_knife_edge_fails_reserve_backed_off_passes():
+    # The calibrated hand case: the 31/24 optimum certifies static feasible but
+    # not lam-robust (reserve below LAM_MIN), while the 26/24 back-off is
+    # lam-robust. lambda_assoc orders the two the same way.
+    from keystone.search.lattice import LAM_MIN
+
+    tol = Tolerances()
+    knife = certify_prefixes(KNIFE_SEQ, 1.0 / 24.0, tol)
+    stand = certify_prefixes(STAND_SEQ, 1.0 / 24.0, tol)
+    assert knife["prefix_feasible"] and stand["prefix_feasible"]
+    assert knife["full_status"] == "feasible" and stand["full_status"] == "feasible"
+    assert knife["full_robust"] is False
+    assert stand["full_robust"] is True
+    assert knife["lambda_assoc"] < LAM_MIN
+    assert stand["lambda_assoc"] >= LAM_MIN
+
+
+def test_skip_predicted_fail_skips_execute(tmp_path):
+    # A predicted knife_edge with skip_predicted_fail set records the
+    # prediction and never runs EXECUTE. No mujoco needed: the skip returns
+    # before the executor and recorder are touched.
+    rec = evaluate_stacking(
+        n=4, dx=1.0 / 24.0, sequence=KNIFE_SEQ, out_dir=str(tmp_path),
+        record=False, skip_predicted_fail=True, verbose=False,
+    )
+    assert rec["predicted_physics"] == "knife_edge"
+    assert rec["execute"]["verdict"] == "skipped_predicted_knife_edge"
+    ag = rec["agreement"]
+    assert ag["three_way"] == "skipped_predicted_knife_edge"
+    assert ag["predicted_physics"] == "knife_edge"
+    assert ag["physics"] is None
+    # The static certificate still holds; only execution was skipped.
+    assert ag["certificate"] is True
+    # The record was written.
+    assert os.path.exists(os.path.join(str(tmp_path), "pipeline_n4_seed0.json"))
+
+
+def test_skip_off_leaves_stand_prediction():
+    # A lam-robust design is predicted stand, so skip_predicted_fail would not
+    # skip it. Checked on the certificate directly (no executor run).
+    stand = certify_prefixes(STAND_SEQ, 1.0 / 24.0, Tolerances())
+    predicted = "stand" if stand["full_robust"] else "knife_edge"
+    assert predicted == "stand"
 
 
 # --------------------------------------------------------------------------
@@ -148,12 +220,14 @@ def test_pipeline_smoke_and_schema(tmp_path):
         assert key in s
     assert isinstance(s["sequence"], list) and len(s["sequence"]) > 0
 
-    # Certify stage.
+    # Certify stage, including the reserve summary and prediction.
     cert = rec["certify"]
-    for key in ("steps", "prefix_feasible", "full_status", "margins"):
+    for key in ("steps", "prefix_feasible", "full_status", "margins",
+                "lam_min", "prefix_robust", "full_robust", "lambda_assoc"):
         assert key in cert
     assert cert["prefix_feasible"] is True
     assert len(cert["steps"]) == len(s["sequence"])
+    assert rec["predicted_physics"] in ("stand", "knife_edge")
 
     # Plan stage: every block carries a protocol and the params an arm needs.
     plan = rec["plan"]
@@ -174,12 +248,14 @@ def test_pipeline_smoke_and_schema(tmp_path):
                     "struct_disturb_rel", "struct_rot"):
             assert key in st
 
-    # Agreement: the three-way verdict.
+    # Agreement: the three-way verdict plus the prediction.
     ag = rec["agreement"]
-    for key in ("search_claim", "certificate", "physics", "three_way"):
+    for key in ("search_claim", "certificate", "physics", "three_way",
+                "predicted_physics"):
         assert key in ag
     assert ag["search_claim"] is True
     assert ag["certificate"] is True
+    assert ag["predicted_physics"] == rec["predicted_physics"]
 
     # The JSON record was written to disk.
     js = os.path.join(str(tmp_path), "pipeline_n3_seed0.json")

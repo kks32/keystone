@@ -41,6 +41,7 @@ from keystone import (
     solve_p0,
 )
 from keystone.search import bnb
+from keystone.search import lattice as LT
 
 TOL = Tolerances()
 MU = 0.7
@@ -258,6 +259,49 @@ def test_bnb_equal_materials_match_default_baseline():
     assert res.closed_size == 254
     assert res.host_verifications == 5
     assert res.host_verified
+
+
+def test_bnb_robust_disabled_matches_static_baseline():
+    # The reserve flag defaults off; passing robust=False explicitly must trace
+    # the recorded static baseline node for node and solve for solve. This pins
+    # the reserve branch to degenerate exactly onto the default.
+    res = bnb.certify(
+        3, 1.0 / 12.0, TOL, opts=SolverOptions(), progress=False, robust=False
+    )
+    assert res.certified and res.stop_reason == "optimal"
+    assert abs(res.optimum - 5.0 / 6.0) < 1e-9
+    assert [tuple(a) for a in res.sequence] == [(0, -4), (1, 0), (2, 4)]
+    assert res.nodes_expanded == 254
+    assert res.nodes_generated == 1085
+    assert res.qp_solves == 2002
+    assert res.closed_size == 254
+    assert res.host_verifications == 5
+    assert res.info["robust"] is False
+
+
+def test_bnb_robust_optimum_within_static():
+    # Reserve mode certifies an optimum no larger than the static optimum
+    # (robust-feasible is a subset of feasible), host verified, and the
+    # certified set is actually lam-robust in the kernel. At n=3 on the 1/12
+    # grid the overhang is unchanged (5/6) but the design carries reserve.
+    static = bnb.certify(3, 1.0 / 12.0, TOL, opts=SolverOptions(), progress=False)
+    rob = bnb.certify(
+        3, 1.0 / 12.0, TOL, opts=SolverOptions(), progress=False, robust=True
+    )
+    assert rob.certified and rob.host_verified
+    assert rob.optimum <= static.optimum + 1e-9
+    assert rob.info["robust"] is True
+    assert abs(rob.info["lam_min"] - LT.LAM_MIN) < 1e-12
+
+    spec = LT.LatticeSpec(n_max=3, dx=1.0 / 12.0)
+    key = tuple(sorted((int(L), int(j)) for (L, j) in rob.sequence))
+    opts = SolverOptions()
+    m, c = LT.robust_margins_of_states(
+        spec, LT.batch_states(spec, [key]), TOL.eps_reg, TOL.tol_cone,
+        LT.LAM_MIN, solver_tol=opts.solver_tol, max_iter=opts.max_iter,
+    )
+    feas = (float(np.asarray(m)[0]) <= TOL.tol_feas) and bool(np.asarray(c)[0])
+    assert feas is True
 
 
 def test_bnb_heavy_ballast_beats_light_at_n3():
