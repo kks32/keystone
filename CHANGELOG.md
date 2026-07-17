@@ -1,5 +1,43 @@
 # CHANGELOG
 
+## 0.0.1 (2026-07-17, unreleased) - README and MATH_REFERENCE rewrite
+
+Documentation pass for precision and honesty. No code changed.
+
+- Removed the framing that presented verified feasibility as a novelty over
+  rigid-block-equilibrium tools. A zero-tension RBE solution is the same
+  recheckable force witness, so keystone now states no claim on the feasible
+  side. The two properties kept, both at single-assembly size: an infeasible
+  verdict carries a checked collapse mechanism (dual ray, y.w > 0 and
+  A^T y + G^T z = 0 with z >= 0), which the RBE lineage does not output; and the
+  solver verifies or abstains across three verdicts, which matters because one
+  branch-and-bound optimality proof consumes about 10^5 verdicts.
+- Doc prose no longer uses the words "certificate" and "certified" except the
+  standard term "Farkas certificate", used once in the duality statement.
+  Replacement vocabulary: a verified force state, a checked collapse mechanism,
+  proved optimal on the stated grid, verify or abstain. Code identifiers are
+  unchanged.
+- MATH_REFERENCE rewritten around what is implemented, Strang style: unknowns
+  and a worked single-block A; the exact 2D cone, the inscribed 3D pyramid with
+  its bound, and the associative lift with the falls-transfers, stands-does-not
+  asymmetry; P4, P0, P2, P3 as coded, with the three-valued verdict rule, the
+  four KKT residuals, and the measured 560*eps_reg bias; the feasible and
+  infeasible checks as equations; lateral reserve with the calibration table
+  (gap 0.0139/0.0175, threshold 0.015, 10 of 10) and the price of reserve; the
+  lattice state, actions, legality, and reachability modes; the branch-and-bound
+  bound with the one-step lemma, monotonicity, optimality, and transposition
+  arguments; the learning feature map, loss, and value target; and a results
+  registry mapping every claim to a test. Numbers cite
+  out/search/material/summary.txt and out/robust/reserve_sweep_n4.json.
+- README shortened and made plain. Added an implemented-versus-planned table
+  (P0 to P4 done, P5 planned, boxes done, meshes and vaults planned M2), an
+  honest positioning paragraph (speed and batching as the engineering claims,
+  the infeasible mechanism and verify-or-abstain at exact size, the associative
+  upper-estimate caveat), and a note that the name is provisional and vault
+  geometry is not built yet. Corrected the stale test count and replaced the
+  unverified overhang claim with the branch-and-bound-proved 5/4 optimum at
+  n = 4, dx = 1/12.
+
 ## 0.0.1 (2026-07-15, unreleased) - escalation, KKT certificate, bound review
 
 Second solver-layer review pass. Fixes verdict escalation, exact-oracle

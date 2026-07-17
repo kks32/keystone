@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "keystone"
 version = "0.0.1"
-description = "Rigid-block equilibrium for 2D and 3D box assemblies. Certified convex solvers in JAX, batched; load-gradient support today, pose and friction gradients planned."
+description = "Rigid-block equilibrium for 2D and 3D box assemblies. Fast batched convex solvers in JAX; verify-or-abstain verdicts; load gradients today, pose and friction gradients planned."
 requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.26",
