@@ -1,16 +1,18 @@
-# MATH_REFERENCE
+# Mathematical Reference
 
-The mathematics of what keystone computes today. LaTeX is allowed in this
-file only. The prose is plain.
+A masonry structure is a collection of rigid blocks held together by gravity
+and friction alone; the joints carry no tension. Whether such a structure
+stands is a question about forces: does a set of contact forces exist,
+compressive and within the friction limits, that balances every block? This
+document develops that question into the linear algebra keystone implements,
+derives the solvers built on it, and states the proofs behind the archived
+results.
 
-Scope: box assemblies in 2D and 3D, the exact 2D friction cone and the
-inscribed 3D pyramid, the four solvers P0, P2, P3, P4, the checks that back
-each verdict, the lateral-reserve screen, and the lattice search that consumes
-verdicts. General meshes, the SOCP cone, and the non-associative iteration are
-planned and are not described here.
-
-Every symbol is defined where it first appears. Equations are numbered only
-where later text refers back to them.
+The scope is what runs today: box assemblies in 2D and 3D, the exact 2D
+friction cone, the inscribed 3D pyramid, the feasibility, load-factor,
+critical-friction, and margin solvers with the checks behind each verdict,
+the lateral-reserve screen, and the lattice search. General meshes, the exact
+3D cone, and the non-associative iteration are planned and not covered.
 
 ## 1. Unknowns, sign convention, and the matrix A
 
@@ -178,7 +180,7 @@ the true model; the code marks it `unknown`.
 
 ## 3. The four solvers
 
-### P4, the elastic margin, exactly as coded
+### The elastic margin (P4)
 
 P4 measures how far an assembly is from equilibrium inside the cone. The JAX
 backend solves the slack quadratic program
@@ -208,7 +210,7 @@ feasibility threshold $\text{tol\_feas} = 10^{-8}$. Infeasibility residuals are
 independent of $\varepsilon$, so raising or lowering it does not move a
 falls-verdict.
 
-### P0, the three-valued verdict
+### The feasibility verdict (P0)
 
 P0 asks the yes/no question: does an $f \in K$ with $A f + w = 0$ exist. The
 answer is one of three values, and each is checked before it is returned rather
@@ -233,8 +235,8 @@ mechanism.
 Anything that passes neither check is NO_CONVERGE. The solver abstains rather
 than guess.
 
-Alongside the verdict, keystone reports whether the P4 iterate is not just
-feasible but optimal for (4). Optimality is a full Karush-Kuhn-Tucker check on
+Alongside the verdict, keystone reports whether the P4 iterate is optimal for
+(4), beyond being feasible. Optimality is a full Karush-Kuhn-Tucker check on
 the slack program: four residuals, each an infinity norm, must sit below
 $\text{tol\_gap}$.
 
@@ -264,7 +266,7 @@ $\text{tol\_dual} = 10\,\text{tol\_feas}$, and $\text{tol\_gap} =
 100\,\text{tol\_feas}$. They live in one `Tolerances` dataclass and are passed
 explicitly.
 
-### P2, the load factor, by bisection
+### The load factor (P2)
 
 P2 finds the largest multiple of a live load the assembly carries:
 
@@ -282,7 +284,7 @@ bisection stops and marks the band undecided. The reported factor is the
 largest verified-feasible bracket bound. In 2D with the linear cone it is an
 upper estimate of the true Coulomb capacity (Section 2.4).
 
-### P3, the critical friction, by bisection
+### The critical friction (P3)
 
 P3 finds the least friction that keeps the assembly standing:
 
@@ -389,7 +391,7 @@ $dx = 1/12$, friction $\mu = 0.7$, the price is
 
 Source: `examples/robust_sweep.py`, `out/robust/reserve_sweep_n4.json`.
 
-## 6. The lattice environment as mathematics
+## 6. The lattice environment
 
 The search runs on a fixed 2D scene: a pedestal 6 wide and 1 tall with its right
 edge at $x = 0$, and unit cubes stacked above it on a grid of step $dx$. A cube
@@ -437,7 +439,7 @@ jamming, which is why `slide_clear` exists. The clearances are the exact
 unit-cell gaps, motions are single-axis and straight, and no gripper or tool
 volume is modeled; those limits are recorded in `docs/KNOWN_LIMITS.md`.
 
-## 7. The branch-and-bound bound and its proof
+## 7. The optimality proof
 
 For small $n$ the search proves the true grid optimum of maximum overhang, not
 just a good stack. It runs best-first branch and bound over prefix-feasible
