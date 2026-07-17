@@ -116,9 +116,9 @@ def test_settle_offset_pair_045_stands():
 
 
 def test_to_mjcf_pairs_and_static():
-    # Explicit pairs: one ground pair per block plus AABB-adjacent block pairs.
-    # A stacked pair gives 2 ground pairs and 1 block-block pair. A static index
-    # emits no free joint for that body.
+    # Explicit pairs: one ground pair per block plus block-block pairs. A
+    # stacked pair (adjacent) gives 2 ground pairs and 1 block-block pair under
+    # either mode. A static index emits no free joint for that body.
     boxes = [box_2d(1.0, 1.0, 0.0, 0.5), box_2d(1.0, 1.0, 0.0, 1.5)]
     xml = to_mjcf(boxes, 0.6, free=[1])
     assert xml.count("<pair") == 3
@@ -126,6 +126,64 @@ def test_to_mjcf_pairs_and_static():
     # The model compiles.
     model = mujoco.MjModel.from_xml_string(xml)
     assert model.npair == 3
+
+
+def test_to_mjcf_pairs_all_vs_adjacent():
+    # Three blocks: two stacked (adjacent) plus one far block outside the
+    # stack's AABB neighborhood. "all" emits every block-block pair; "adjacent"
+    # keeps only the stacked pair. Ground pairs cover every block in both.
+    boxes = [
+        box_2d(1.0, 1.0, 0.0, 0.5),
+        box_2d(1.0, 1.0, 0.0, 1.5),
+        box_2d(1.0, 1.0, 5.0, 0.5),
+    ]
+    # all: 3 ground + 3 block-block (0-1, 0-2, 1-2).
+    xml_all = to_mjcf(boxes, 0.6, pairs="all")
+    assert xml_all.count("<pair") == 3 + 3
+    # adjacent: 3 ground + 1 block-block (0-1 only).
+    xml_adj = to_mjcf(boxes, 0.6, pairs="adjacent")
+    assert xml_adj.count("<pair") == 3 + 1
+    # Default is "all".
+    assert to_mjcf(boxes, 0.6).count("<pair") == 6
+    # all_pairs is a deprecated alias that overrides pairs when set.
+    assert to_mjcf(boxes, 0.6, all_pairs=True).count("<pair") == 6
+    assert to_mjcf(boxes, 0.6, all_pairs=False).count("<pair") == 4
+    assert to_mjcf(boxes, 0.6, pairs="adjacent", all_pairs=True).count("<pair") == 6
+    # A bad mode raises.
+    with pytest.raises(ValueError, match="pairs"):
+        to_mjcf(boxes, 0.6, pairs="triangular")
+    # Both compile.
+    assert mujoco.MjModel.from_xml_string(xml_all).npair == 6
+    assert mujoco.MjModel.from_xml_string(xml_adj).npair == 4
+
+
+def test_from_mjcf_two_geom_body_density_roundtrip():
+    # A body with two box geoms of one density. from_mjcf distributes the body
+    # mass over the geoms by volume share, so each geom recovers that density
+    # (not the full body mass on each) and total mass is conserved.
+    density = 1500.0
+    xml = f"""
+    <mujoco>
+      <worldbody>
+        <geom name="ground" type="plane" size="5 5 0.1"/>
+        <body pos="0 0 1">
+          <freejoint/>
+          <geom name="a" type="box" size="0.5 0.5 0.5" density="{density}" pos="0 0 0"/>
+          <geom name="b" type="box" size="0.2 0.3 0.4" density="{density}" pos="1 0 0"/>
+        </body>
+      </worldbody>
+    </mujoco>
+    """
+    boxes = from_mjcf(xml)
+    assert len(boxes) == 2
+    for b in boxes:
+        assert abs(b.density - density) < 1e-9 * density
+    # Total recovered mass equals the body mass in the model (body 1, the only
+    # added body; body 0 is the world).
+    model = mujoco.MjModel.from_xml_string(xml)
+    body_mass = float(model.body_mass[1])
+    recovered = sum(b.mass for b in boxes)
+    assert abs(recovered - body_mass) < 1e-9 * body_mass
 
 
 def test_restacked_cubes_contact_planes_meet():

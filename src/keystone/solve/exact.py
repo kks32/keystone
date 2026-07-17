@@ -25,7 +25,7 @@ either check failing yields NO_CONVERGE, never a false FEASIBLE/INFEASIBLE.
 
 import numpy as np
 import scipy.sparse as sp
-from scipy.optimize import linprog
+from scipy.optimize import linprog, nnls
 
 from ..geometry.tolerances import Tolerances
 from ..mechanics.assemble import EquilibriumSystem
@@ -75,6 +75,82 @@ def _primal_residual(A, w, G, f):
     margin = float(np.linalg.norm(r) / denom)
     viol = float(max(0.0, float(np.max(G @ f)))) if G.shape[0] else 0.0
     return margin, viol
+
+
+def _dual_cone_residual(y, A, G):
+    """NNLS residual of A^T y in the dual cone K* = {-G^T z : z >= 0}.
+
+    K* is the dual of {f : G f <= 0}: a vector c is in K* exactly when there is
+    z >= 0 with c + G^T z = 0. Solve that by nonnegative least squares on
+    G^T z = -A^T y and report the residual and the z >= 0 it found. A residual
+    near zero means A^T y lies in K*, witnessed by z. This is the same check
+    _verify_farkas and _dual_cone_violation use, read straight off G.
+    """
+    A = np.asarray(A, dtype=float)
+    G = np.asarray(G, dtype=float)
+    y = np.asarray(y, dtype=float)
+    target = -(A.T @ y)
+    try:
+        z, rnorm = nnls(G.T, target)
+        return float(rnorm), z
+    except RuntimeError:
+        # NNLS hit its iteration cap; treat as an unproven membership.
+        return float("inf"), None
+
+
+def _validate_p2_mechanism(y, A, G, w_dead, w_live, lam, tol):
+    """Validate a P2 collapse mechanism on the final (oriented, normalized) y.
+
+    Every check runs on the vector that is actually returned, not on the raw
+    LP dual, so a wrong sign or scale cannot slip through. The checks:
+
+    stationarity and dual-cone membership. A^T y must lie in K*, so there is
+    z >= 0 with A^T y + G^T z = 0 (the f-block LP stationarity: the objective
+    has no force term, so A^T y is a negative combination of the cone rows,
+    active where G f = 0). The NNLS dual residual must clear tol_dual and the
+    multipliers z must be nonnegative.
+
+    live-load normalization. The live load must do positive work on the
+    motion, y . w_live > tol_power, which fixes the sign of the mechanism.
+
+    load-factor consistency. The kinematic collapse identity
+    lam* = -(y . w_dead) / (y . w_live) must reproduce the reported lam. This
+    ties the mechanism to the load factor it collapses under.
+
+    Returns a dict of the measured quantities and a single valid flag.
+    """
+    y = np.asarray(y, dtype=float)
+    w_dead = np.asarray(w_dead, dtype=float)
+    w_live = np.asarray(w_live, dtype=float)
+    finite = bool(np.all(np.isfinite(y)))
+    norm = float(np.linalg.norm(y))
+    normalized = abs(norm - 1.0) <= 1e-6
+    dual_res, z = _dual_cone_residual(y, A, G)
+    signs_ok = z is not None and bool(np.all(z >= -tol.tol_dual))
+    dead_power = float(y @ w_dead)
+    live_power = float(y @ w_live)
+    if abs(live_power) > tol.tol_power:
+        lam_from_mech = -dead_power / live_power
+        lam_consistent = abs(lam_from_mech - lam) <= 1e-4 * max(1.0, abs(lam))
+    else:
+        lam_from_mech = float("nan")
+        lam_consistent = False
+    dual_ok = dual_res <= tol.tol_dual
+    live_ok = live_power > tol.tol_power
+    valid = bool(
+        finite and normalized and dual_ok and signs_ok and live_ok
+        and lam_consistent
+    )
+    return {
+        "dual_residual": dual_res,
+        "multiplier_signs_ok": signs_ok,
+        "dead_load_power": dead_power,
+        "live_load_power": live_power,
+        "lam_from_mechanism": lam_from_mech,
+        "lam_consistent": bool(lam_consistent),
+        "normalized": bool(normalized),
+        "valid": valid,
+    }
 
 
 def _complementary_slackness(G, f, z):
@@ -127,21 +203,24 @@ def _farkas_certificate(A, w, G, dim, tol):
         return None, {"load_power": 0.0, "dual_residual": float("inf"),
                       "certified": False}
     y = np.asarray(res.x[:m])
-    z = np.asarray(res.x[m:])
-    dual_res = float(np.linalg.norm(A.T @ y + G.T @ z))
-    load_power = float(y @ w)
+    # Recheck on the final normalized vector, never on the LP's raw scale or
+    # sign. Normalize, then confirm A^T yn lies in K* by NNLS (its own z >= 0)
+    # and the load power yn . w is positive. The LP's own z is discarded.
+    norm_y = float(np.linalg.norm(y))
+    yn = y / norm_y if norm_y > 0.0 else y
+    dual_res, zc = _dual_cone_residual(yn, A, G)
+    load_power = float(yn @ w)
+    signs_ok = zc is not None and bool(np.all(zc >= -tol.tol_dual))
     certified = bool(
         np.isfinite(load_power)
         and load_power > tol.tol_power
         and dual_res <= tol.tol_dual
+        and signs_ok
     )
     mechanism = None
     if certified:
-        norm_y = np.linalg.norm(y)
-        yn = y / norm_y if norm_y > 0.0 else y
         rpb = 3 if dim == 2 else 6
         mechanism = yn.reshape(m // rpb, rpb)
-        load_power = float(yn @ w)
     return mechanism, {"load_power": load_power, "dual_residual": dual_res,
                        "certified": certified}
 
@@ -267,13 +346,21 @@ def solve_p2_exact(
         if censored:
             info["censored"] = True
             info["note"] = "lambda hit lam_hi cap; lambda_assoc is a cap"
-        # Mechanism from the equality duals, valid at an LP optimum. Orient so
-        # gravity does nonnegative power, then normalize. Only at an uncensored
-        # optimum is this a physical collapse mechanism; a censored optimum is
-        # the capped problem, so no mechanism is attached.
+        # Mechanism from the equality duals, valid at an LP optimum. scipy doc
+        # (OptimizeResult from linprog): eqlin.marginals is "the sensitivity
+        # (partial derivative) of the objective function with respect to the
+        # right-hand side of the equality constraints". The KKT identity
+        # A^T y_eq + G^T z_ineq = 0 with z_ineq <= 0 for the <= rows puts
+        # A^T (eqlin.marginals) in -K*, so the raw dual has the reversed sign.
+        # The kinematic collapse mechanism must satisfy compatibility A^T y in
+        # K* (admissible contact forces resist the motion), so orient to the
+        # sign whose A^T y lands in the dual cone, then normalize and validate
+        # the FINAL vector.
         mechanism = None
         y = np.asarray(res.eqlin.marginals, dtype=float)
-        if float(y @ w_dead) < 0.0:
+        res_pos, _ = _dual_cone_residual(y, A, G)
+        res_neg, _ = _dual_cone_residual(-y, A, G)
+        if res_neg < res_pos:
             y = -y
         norm_y = float(np.linalg.norm(y))
         yn = y / norm_y if norm_y > 0.0 else y
@@ -281,11 +368,26 @@ def solve_p2_exact(
         cs = _complementary_slackness(G, f, z)
         info["complementary_slackness"] = cs
         info["complementary_slackness_ok"] = bool(cs <= tol.tol_dual)
+        lam_upper = None
         if not censored:
-            mechanism = yn.reshape(nrows // rpb, rpb)
+            # Only at an uncensored optimum is this a physical collapse
+            # mechanism; a censored optimum is the capped problem. Validate the
+            # oriented, normalized vector before returning it.
+            val = _validate_p2_mechanism(yn, A, G, w_dead, w_live, lam, tol)
+            info["mechanism_validation"] = val
+            if val["valid"]:
+                mechanism = yn.reshape(nrows // rpb, rpb)
+            else:
+                info["note"] = "P2 mechanism failed post-normalization validation"
+            # The exact associative optimum both is achievable and, for a 2D
+            # exact cone, upper-bounds true capacity.
+            if direction == "upper":
+                lam_upper = lam
         return Result(
             status=FEASIBLE, margin=0.0, forces=f * float(system.W),
-            lambda_assoc=lam, mechanism=mechanism, info=info, **common,
+            lambda_assoc=lam, lambda_achievable=lam,
+            lambda_upper_verified=lam_upper,
+            mechanism=mechanism, info=info, **common,
         )
     # lam = 0 is fixed geometry, so an uncensored bound tag applies here.
     direction, tag = _p2_bound(system.cone, False)
@@ -299,8 +401,12 @@ def solve_p2_exact(
         if not farkas["certified"]:
             info["note"] = "HiGHS infeasible but Farkas certificate failed validation"
             return Result(status=NO_CONVERGE, margin=float("inf"), info=info, **common)
+        # lam = 0 is itself the verified-infeasible endpoint; it upper-bounds
+        # true capacity in 2D.
+        lam_upper = 0.0 if direction == "upper" else None
         return Result(
             status=INFEASIBLE, margin=float("inf"), lambda_assoc=0.0,
+            lambda_achievable=0.0, lambda_upper_verified=lam_upper,
             mechanism=mechanism, info=info, **common,
         )
     return Result(status=NO_CONVERGE, margin=float("inf"), info=info, **common)

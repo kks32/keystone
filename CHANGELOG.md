@@ -1,5 +1,36 @@
 # CHANGELOG
 
+## 0.0.1 (2026-07-17, unreleased) - search stochasticity and exact-n reporting
+
+Experimental-validity fixes in the learning stack (keystone.search.mcts,
+keystone.search.az, examples/az_overhang.py) after external review. See
+out/search/az_v3_results.md for the corrected numbers and claims.
+
+- Search seeds are real. The constructor RNG (created and never used before)
+  now drives a 1e-9-scale tie-breaking jitter on PUCT scores, optional root
+  Dirichlet noise (data collection only), and an optional visit-count
+  sampling temperature (Search.sample_action, argmax by default). One seed
+  reproduces its run exactly; different seeds differ. tie_eps=0.0 restores
+  the old first-sorted-action tie-breaking. The five-seed medians in
+  out/search/az_run.log and az_v2_eval.log were five identical deterministic
+  runs; each was one measurement.
+- Exact-n bookkeeping. Search.best_by_count records the best verified state
+  per block count next to the old best-at-any-depth tracking
+  (Search.exact_overhang, Search.exact_sequence). The v2 logs credited
+  4-block designs to n=5 and n=6 rows; headline claims now use exact-n.
+- Root features carry the horizon. encode_state adds n / N_MAX_GLOBAL and
+  log n / log N_MAX_GLOBAL, so the empty root is distinct per target size.
+  Feature length F changed; old checkpoints are incompatible and load_params
+  now rejects shape mismatches instead of failing at the first forward pass.
+- DAG-correct value targets. az._subtree_targets aggregates over all stored
+  parent edges (Search._children_of) by a reverse topological pass instead
+  of following each node's first stored parent only.
+- Auxiliary head retargeted. The default auxiliary target is the lateral
+  reserve capacity min(|lam+|, |lam-|) from the existing reserve kernel,
+  clipped to [0, 0.25] (az.reserve_capacities, az.attach_reserve_targets).
+  assemble_arrays(aux_mode="margin") reproduces the old near-constant
+  equilibrium-residual target for comparison.
+
 ## 0.0.1 (2026-07-17, unreleased) - README and MATH_REFERENCE rewrite
 
 Documentation pass for precision and honesty. No code changed.

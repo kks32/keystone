@@ -145,8 +145,8 @@ $k$ is anisotropic and is gated behind an explicit flag.
 The verdict machinery needs the dual cone $K^* = \{ c : c^\top f \ge 0
 \ \text{for all}\ f \in K \}$. For a polyhedral cone written $\{ f : G f \le
 0 \}$, a vector lies in $K^*$ exactly when it is a nonnegative combination of
-the rows of $G$: membership of $A^\top y$ in $K^*$ means there is $z \ge 0$ with
-$A^\top y + G^\top z = 0$. For the 2D wedge this has the closed form: writing
+the rows of $-G$: membership of $A^\top y$ in $K^*$ means there is $z \ge 0$
+with $A^\top y + G^\top z = 0$, that is $A^\top y = -G^\top z$. For the 2D wedge this has the closed form: writing
 $A^\top y$ per vertex as $(z_n, z_u)$, membership is $z_n \ge \mu\,|z_u|$.
 
 ### The associative lift and its consequence
@@ -160,23 +160,35 @@ the outward normal of the lateral facet has a tangential part of unit length
 comes with opening, or dilation, at rate $\mu$ times the slide.
 
 True Coulomb friction slides without opening: its dilation angle is zero, which
-makes it non-associative. Allowing the extra opening enlarges the set of
-admissible collapse motions, which can only lower the collapse load. Therefore
-the associative collapse load is an upper estimate of the true collapse load
-(Drucker; Gilbert and Casapulla). Every solver in keystone is associative, and
-every field carrying such a quantity says `assoc` in its name.
+makes it non-associative. Every solver in keystone uses the associative model,
+and every field carrying such a quantity says `assoc` in its name.
 
-The estimate is one-sided, and the two verdicts are not symmetric. Let
-$\lambda_{\text{assoc}}$ be the associative load factor and
-$\lambda_{\text{true}}$ the true one, with
-$\lambda_{\text{true}} \le \lambda_{\text{assoc}}$. If at a load the associative
-model reports collapse (a falls-verdict), the true model, which has less
-capacity, also collapses: a falls-verdict transfers to the true model. If the
-associative model reports that the structure stands, the true model may still
-collapse: a stands-verdict does not transfer. The 2D linear cone keeps this
-ordering. The inscribed 3D pyramid combines the associative overestimate with
-the cone underestimate of (3), so its load factor has no fixed ordering against
-the true model; the code marks it `unknown`.
+Why the associative value bounds the true one from above needs care, because a
+common shortcut is wrong. Enlarging the set of collapse motions lowers a
+kinematic minimum, so a set-inclusion argument by itself points the wrong way.
+The sound argument uses only statics. If the structure truly stands at load
+$\lambda$, the physical contact forces exist, satisfy Coulomb's inequality, and
+balance the loads: they are a point of $K$ with $A f + w(\lambda) = 0$. So
+standing implies equilibrium-existence, and the largest $\lambda$ with an
+equilibrium force state, which is what keystone computes, satisfies
+$\lambda_{\text{true}} \le \lambda_{\text{assoc}}$. No flow rule enters that
+direction.
+
+The converse fails: an equilibrium force state can exist that non-associative
+friction never realizes, so the structure may collapse below
+$\lambda_{\text{assoc}}$. Livesley (1978) first exhibited this, and the
+non-associative formulations (Gilbert and Casapulla 2006; Portioli et al. 2014)
+report associative load factors as upper estimates relative to their
+non-associative solutions.
+
+The two verdicts are therefore not symmetric. A falls-verdict carries a checked
+collapse mechanism that refutes every force state in $K$, and $K$ is the same
+cone in both models, so a falls-verdict transfers to the true model. A
+stands-verdict asserts only that an equilibrium force state exists, which the
+true model may fail to realize: it does not transfer. The 2D linear cone keeps
+this ordering. The inscribed 3D pyramid combines the associative overestimate
+with the cone underestimate of (3), so its load factor has no fixed ordering
+against the true model; the code marks it `unknown`.
 
 ## 3. The four solvers
 

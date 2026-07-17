@@ -140,5 +140,58 @@ def test_targets_reproduce_certified_cells():
     assert np.allclose(sw[:, 2], S / 2.0, atol=1e-12)
 
 
+def test_resolve_panda_xml_default(monkeypatch):
+    # No env var, no argument: the bundled refs/ default, which exists here.
+    from keystone.interop.franka_scene import PANDA_XML, resolve_panda_xml
+
+    monkeypatch.delenv("KEYSTONE_MENAGERIE", raising=False)
+    assert resolve_panda_xml() == PANDA_XML
+
+
+def test_resolve_panda_xml_env_var_wins(monkeypatch, tmp_path):
+    # The env var takes precedence, over both the argument and the refs/ default.
+    from keystone.interop import franka_scene as fs
+
+    root = tmp_path / "menagerie"
+    (root / "franka_emika_panda").mkdir(parents=True)
+    panda = root / "franka_emika_panda" / "panda.xml"
+    panda.write_text("<mujoco/>")
+    monkeypatch.setenv("KEYSTONE_MENAGERIE", str(root))
+    assert fs.resolve_panda_xml() == str(panda)
+    # Env var beats an explicit argument.
+    assert fs.resolve_panda_xml(menagerie="/no/such/root") == str(panda)
+
+
+def test_resolve_panda_xml_argument(monkeypatch, tmp_path):
+    # With no env var the argument is used, over the refs/ default.
+    from keystone.interop import franka_scene as fs
+
+    monkeypatch.delenv("KEYSTONE_MENAGERIE", raising=False)
+    root = tmp_path / "arg_menagerie"
+    (root / "franka_emika_panda").mkdir(parents=True)
+    panda = root / "franka_emika_panda" / "panda.xml"
+    panda.write_text("<mujoco/>")
+    assert fs.resolve_panda_xml(menagerie=str(root)) == str(panda)
+
+
+def test_resolve_panda_xml_missing_raises_listing_options(monkeypatch, tmp_path):
+    # A missing file raises with the source and all three options listed.
+    from keystone.interop import franka_scene as fs
+
+    monkeypatch.setenv("KEYSTONE_MENAGERIE", str(tmp_path / "does_not_exist"))
+    with pytest.raises(FileNotFoundError, match="KEYSTONE_MENAGERIE"):
+        fs.resolve_panda_xml()
+    monkeypatch.delenv("KEYSTONE_MENAGERIE", raising=False)
+    try:
+        fs.resolve_panda_xml(menagerie=str(tmp_path / "nope"))
+    except FileNotFoundError as e:
+        msg = str(e)
+        assert "KEYSTONE_MENAGERIE" in msg
+        assert "menagerie" in msg
+        assert "refs/" in msg
+    else:
+        raise AssertionError("expected FileNotFoundError")
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

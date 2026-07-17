@@ -29,6 +29,14 @@ cube. keystone box geoms stay contype = conaffinity = 0, so only the declared
 pairs generate contact; the panda's own collision geoms keep the menagerie
 defaults. Gravity is MuJoCo's default (0, 0, -9.81).
 
+Menagerie location. compose_scene loads panda.xml from a mujoco_menagerie root
+resolved in this precedence order: the KEYSTONE_MENAGERIE environment variable,
+then the compose_scene `menagerie` argument, then the bundled refs/ default
+(refs/mujoco_menagerie beside the repo root). panda.xml is expected at
+<root>/franka_emika_panda/panda.xml. If it is not found, resolve_panda_xml
+raises with the searched path and all three options listed. The menagerie file
+on disk is never edited.
+
 mujoco is imported lazily. The core package never needs it.
 """
 
@@ -41,12 +49,42 @@ import numpy as np
 
 from ..geometry.boxes import Box, box_2d
 
-# Path to the unmodified menagerie model (kept read-only on disk).
-PANDA_XML = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
-        os.path.abspath(__file__))))),
-    "refs", "mujoco_menagerie", "franka_emika_panda", "panda.xml",
-)
+# Menagerie root and the panda.xml default (kept read-only on disk).
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))))
+_REFS_MENAGERIE = os.path.join(_REPO_ROOT, "refs", "mujoco_menagerie")
+# The bundled default path. resolve_panda_xml applies the env var and argument
+# overrides; this constant is the refs/ fallback.
+PANDA_XML = os.path.join(_REFS_MENAGERIE, "franka_emika_panda", "panda.xml")
+
+
+def resolve_panda_xml(menagerie: str | None = None) -> str:
+    """Resolve the menagerie panda.xml path, checking the options in order.
+
+    Precedence: the KEYSTONE_MENAGERIE environment variable, then the
+    `menagerie` argument, then the bundled refs/ default. Each names a
+    mujoco_menagerie root; panda.xml sits at
+    <root>/franka_emika_panda/panda.xml. Raise a clear error listing every
+    option when the file is absent.
+    """
+    env_root = os.environ.get("KEYSTONE_MENAGERIE")
+    if env_root:
+        root, source = env_root, "KEYSTONE_MENAGERIE"
+    elif menagerie is not None:
+        root, source = str(menagerie), "menagerie argument"
+    else:
+        root, source = _REFS_MENAGERIE, "refs/ default"
+    panda = os.path.join(root, "franka_emika_panda", "panda.xml")
+    if not os.path.isfile(panda):
+        raise FileNotFoundError(
+            f"menagerie panda.xml not found at {panda!r} (from {source}). "
+            "Provide a mujoco_menagerie root by one of, in precedence order: "
+            "set the KEYSTONE_MENAGERIE environment variable, pass "
+            "compose_scene(menagerie=...), or place the repository under refs/ "
+            f"(expected {_REFS_MENAGERIE!r}). Clone it from "
+            "https://github.com/google-deepmind/mujoco_menagerie."
+        )
+    return panda
 
 # Physical scale. Cube side 0.05 m, density 2000 -> 0.25 kg per cube.
 S = 0.05
@@ -268,6 +306,7 @@ def compose_scene(
     dx: float = DX_GRID,
     prop_specs=None,
     staging=None,
+    menagerie: str | None = None,
 ):
     """Compose the full build scene in memory. Returns (spec, SceneInfo).
 
@@ -290,14 +329,18 @@ def compose_scene(
     list of (layer, grid_index_j) in build order; cell_names names them; dx is
     the grid step in keystone units; prop_specs is a list of unit-scale prop
     dicts ([] means no props); staging is an (N, 3) world staging row (None uses
-    the default staging_world)."""
+    the default staging_world).
+
+    menagerie sets the mujoco_menagerie root for panda.xml. None (default)
+    resolves through resolve_panda_xml: KEYSTONE_MENAGERIE, then this argument,
+    then the refs/ default."""
     import mujoco
 
     base_offset = np.asarray(base_offset, dtype=np.float64)
     cells = list(CELLS) if cells is None else list(cells)
     cell_names = list(CELL_NAMES) if cell_names is None else list(cell_names)
     prop_specs = list(PROPS_UNIT) if prop_specs is None else list(prop_specs)
-    spec = mujoco.MjSpec.from_file(PANDA_XML)
+    spec = mujoco.MjSpec.from_file(resolve_panda_xml(menagerie))
     if arm_base_pos is not None:
         link0 = spec.body("link0")
         link0.pos = np.asarray(arm_base_pos, dtype=np.float64).tolist()

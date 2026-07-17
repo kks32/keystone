@@ -23,15 +23,20 @@ Verdict rule (verified, independent of solver flags):
   residual <= tol_dual (Farkas for the polyhedral cone {f : G f <= 0}).
 - Anything else is NO_CONVERGE.
 
-Margin bound on the optimum: a cone-admissible iterate (cone violation
-<= tol_cone) is P4-feasible, so its recomputed margin upper-bounds the
-optimal P4 margin. An iterate that violates the cone is not P4-feasible
-and its margin need not bound the optimum in either direction.
-info["margin_certified"] is True only when the full KKT residual of the
-slack QP (stationarity, equality, inequality violation, complementarity;
-each an inf-norm) sits below tol_gap, certifying the iterate optimal. The
-four residuals are recorded in info["kkt"]. The raw converged flag and
-iteration count are always in info.
+Objective bound on the optimum: the P4 program minimizes the regularized
+objective 0.5 ||A f + w||^2 + 0.5 eps_reg ||f||^2 over the cone. A
+cone-admissible iterate (cone violation <= tol_cone) is P4-feasible, so its
+regularized objective upper-bounds the optimal objective. The reported
+margin ||A f + w|| / ||w|| is not on its own a bound on the optimal margin:
+the regularizer trades residual against force size, so a feasible iterate
+can sit on either side of the optimal margin. An iterate that violates the
+cone is not P4-feasible and bounds nothing.
+info["margin_certified"] is True only when a full KKT check on the slack QP
+holds: the stationarity, equality, inequality-slack, and complementarity
+residuals each sit below tol_gap, and the slack and dual minima sit above
+-tol_gap. That check mirrors qpax's own convergence test and certifies the
+iterate optimal. The residuals and minima are recorded in info["kkt"]. The
+raw converged flag and iteration count are always in info.
 
 P2 and P3 bisect on this verified verdict. A NO_CONVERGE midpoint is not
 treated as infeasible: it escalates to the exact LP oracle on the same
@@ -80,7 +85,7 @@ def margin_core(
     Pure and jit-able. Consumes matrices only, so 2D and 3D share it.
 
     Returns (margin, f, r, viol, gap, converged, iters, res_stat, res_eq,
-    res_ineq, res_comp):
+    res_ineq, res_comp, slack_min, dual_min):
       margin    ||A f + w_total|| / ||w_total||, recomputed by matvec.
       f         the force block of the solution.
       r         the recomputed equilibrium residual A f + w_total.
@@ -91,11 +96,19 @@ def margin_core(
       res_stat  inf-norm of the KKT stationarity residual
                 ||Q x + q + Aeq^T y + Gineq^T z||_inf.
       res_eq    inf-norm of the equality residual ||Aeq x - beq||_inf.
-      res_ineq  inequality violation max(0, max(Gineq x - hineq)).
+      res_ineq  inf-norm of the inequality slack equation
+                ||Gineq x + s_ineq - hineq||_inf.
       res_comp  inf-norm of the complementarity residual ||s_ineq * z||_inf.
-    The four residuals mirror qpax's own convergence test and let a consumer
-    certify the iterate optimal (all four below tol_gap) rather than trust
-    the raw converged flag.
+      slack_min smallest entry of the inequality slack s_ineq.
+      dual_min  smallest entry of the inequality dual z.
+    The first four residuals mirror qpax's own convergence test (refs
+    qpax/qpax/implicit/pdip.py, solve_qp _step: rt stationarity, rc
+    complementarity, ri = G x + s - h the slack equation, re equality).
+    slack_min and dual_min carry the sign conditions s_ineq >= 0, z >= 0 that
+    the interior point keeps structurally but a self-standing optimality check
+    must verify. A consumer certifies the iterate optimal from all of these
+    (the four residuals below tol_gap and both mins above -tol_gap) rather than
+    trust the raw converged flag.
     """
     nf = A.shape[1]
     nrows = A.shape[0]
@@ -123,14 +136,19 @@ def margin_core(
     viol = jnp.maximum(0.0, jnp.max(G @ f))
     gap = s_ineq @ z
     # Full KKT residuals on the augmented slack system, mirroring qpax's own
-    # convergence test (see refs pdip.solve_qp): a consumer decides optimality
-    # from these, not from the raw converged flag.
+    # convergence test (refs qpax/qpax/implicit/pdip.py, solve_qp _step lines
+    # 275-283: rt, rc, ri = G x + s - h, re). res_ineq is the slack equation,
+    # not a raw violation; slack_min and dual_min carry the sign conditions
+    # s_ineq >= 0 and z >= 0 that the interior point keeps structurally. A
+    # consumer decides optimality from these, not from the raw converged flag.
     res_stat = jnp.linalg.norm(Q @ x + q + Aeq.T @ y + Gineq.T @ z, ord=jnp.inf)
     res_eq = jnp.linalg.norm(Aeq @ x - beq, ord=jnp.inf)
-    res_ineq = jnp.maximum(0.0, jnp.max(Gineq @ x - hineq))
+    res_ineq = jnp.linalg.norm(Gineq @ x + s_ineq - hineq, ord=jnp.inf)
     res_comp = jnp.linalg.norm(s_ineq * z, ord=jnp.inf)
+    slack_min = jnp.min(s_ineq)
+    dual_min = jnp.min(z)
     return (margin, f, r, viol, gap, converged, iters,
-            res_stat, res_eq, res_ineq, res_comp)
+            res_stat, res_eq, res_ineq, res_comp, slack_min, dual_min)
 
 
 @functools.lru_cache(maxsize=None)
@@ -244,16 +262,19 @@ class _CoreVerdict:
 
 def _classify_core(
     margin, f, r, viol, gap, converged, iters,
-    res_stat, res_eq, res_ineq, res_comp,
+    res_stat, res_eq, res_ineq, res_comp, slack_min, dual_min,
     A, G, w_total, dim, tol, *, want_mechanism,
 ):
     """Turn raw margin_core outputs into a verified verdict.
 
-    margin_certified is a full KKT check: the iterate certifies the optimal
-    P4 margin only when the stationarity, equality, inequality, and
-    complementarity residuals of the slack QP are each below tol_gap, matching
-    qpax's own convergence criterion. tol_gap defaults to 100 * tol_feas, so
-    the certificate band sits above the interior-point solver_tol target.
+    margin_certified is a full KKT check on the slack QP: the iterate is
+    optimal only when the stationarity, equality, inequality-slack, and
+    complementarity residuals are each below tol_gap and the slack and dual
+    minima (s_ineq and z) are each above -tol_gap. This mirrors qpax's own
+    convergence criterion (refs qpax/qpax/implicit/pdip.py, solve_qp _step)
+    plus the sign conditions the interior point keeps structurally. tol_gap
+    defaults to 100 * tol_feas, so the certificate band sits above the
+    interior-point solver_tol target.
     """
     margin = float(margin)
     f = np.asarray(f)
@@ -267,13 +288,17 @@ def _classify_core(
         "equality": float(res_eq),
         "inequality": float(res_ineq),
         "complementarity": float(res_comp),
+        "slack_min": float(slack_min),
+        "dual_min": float(dual_min),
     }
+    _res_keys = ("stationarity", "equality", "inequality", "complementarity")
     finite = bool(
         np.isfinite(margin) and np.all(np.isfinite(f)) and np.all(np.isfinite(r))
         and all(np.isfinite(v) for v in kkt.values())
     )
-    kkt_ok = all(v <= tol.tol_gap for v in kkt.values())
-    margin_certified = bool(finite and kkt_ok)
+    residuals_ok = all(kkt[k] <= tol.tol_gap for k in _res_keys)
+    nonneg_ok = kkt["slack_min"] >= -tol.tol_gap and kkt["dual_min"] >= -tol.tol_gap
+    margin_certified = bool(finite and residuals_ok and nonneg_ok)
     primal_ok = bool(finite and margin <= tol.tol_eq and viol <= tol.tol_cone)
     if primal_ok:
         return _CoreVerdict(
@@ -304,10 +329,12 @@ def _classify_core(
 def _core_verdict(A, G, w_total, dim, tol, jitfn, *, want_mechanism):
     """Solve margin_core once and classify the verdict."""
     (margin, f, r, viol, gap, converged, iters,
-     res_stat, res_eq, res_ineq, res_comp) = jitfn(A, w_total, G, tol.eps_reg)
+     res_stat, res_eq, res_ineq, res_comp, slack_min, dual_min) = jitfn(
+        A, w_total, G, tol.eps_reg
+    )
     return _classify_core(
         margin, f, r, viol, gap, converged, iters,
-        res_stat, res_eq, res_ineq, res_comp,
+        res_stat, res_eq, res_ineq, res_comp, slack_min, dual_min,
         A, G, w_total, dim, tol, want_mechanism=want_mechanism,
     )
 
@@ -470,11 +497,19 @@ def solve_p2(
     """P2 associative load factor by bisection on lambda.
 
     Feasibility of P4 is monotone in lambda, so the feasible set is an
-    interval [0, lambda*]. lambda_assoc is the certified-feasible lower
-    bracket bound. The verdict at each midpoint is verified; a NO_CONVERGE
-    midpoint escalates to the exact oracle (tri-state bisection). The
-    mechanism comes from the infeasible side of the final bracket, the
+    interval [0, lambda*]. The verdict at each midpoint is verified; a
+    NO_CONVERGE midpoint escalates to the exact oracle (tri-state bisection).
+    The mechanism comes from the infeasible side of the final bracket, the
     force state from the feasible side.
+
+    Two bracket endpoints are reported. lambda_assoc (equal to
+    lambda_achievable) is the verified-feasible lower bound lam_lo: it is
+    achievable in the associative model but is not ordered against true
+    Coulomb capacity. lambda_upper_verified is the verified-infeasible upper
+    bound lam_hi. Since lam_hi is verified infeasible, lam_hi >= lambda*_assoc
+    >= lambda_true for the 2D exact cone, so lam_hi upper-bounds true
+    capacity. physical_bound_direction describes lam_hi, not lambda_assoc.
+    info records lam_lo_feasible, lam_hi, and lam_hi_verified_infeasible.
     """
     if not (lam_hi > 0.0):
         raise ValueError(f"lam_hi must be > 0, got {lam_hi!r}")
@@ -499,13 +534,19 @@ def solve_p2(
     info["converged"] = v0.converged
     info["margin_certified"] = v0.margin_certified
 
-    def result(status, lam_assoc, mechanism, forces, extra, *, direction=direction):
+    def result(status, lam_assoc, mechanism, forces, extra, *,
+               direction=direction, lam_upper=None):
+        # lam_assoc is the verified-feasible (achievable) bound; lam_upper is
+        # the verified-infeasible bound that upper-bounds true capacity in 2D.
+        # physical_bound_direction describes lam_upper.
         merged = {**info, **extra}
         return Result(
             status=status,
             margin=v0.margin,
             forces=forces,
             lambda_assoc=lam_assoc,
+            lambda_achievable=lam_assoc,
+            lambda_upper_verified=lam_upper,
             mechanism=mechanism,
             cone_model=system.cone,
             physical_bound_direction=direction,
@@ -518,11 +559,15 @@ def solve_p2(
                       {"note": "lam=0 verdict uncertified"}, direction=None)
 
     if s0 == INFEASIBLE:
-        # Already collapsing under dead load. lambda* is zero.
+        # Already collapsing under dead load. lambda* is zero, and lam = 0 is
+        # itself the verified-infeasible endpoint: it upper-bounds true.
         return result(
             INFEASIBLE, 0.0, v0.mechanism, None,
             {"bracket_width": 0.0, "load_power": (v0.farkas or {}).get("load_power"),
-             "forces_certified_by": v0.certified_by},
+             "forces_certified_by": v0.certified_by,
+             "lam_lo_feasible": None, "lam_hi": 0.0,
+             "lam_hi_verified_infeasible": True},
+            lam_upper=0.0,
         )
 
     # Push lam_hi until the top of the bracket is certified infeasible,
@@ -554,17 +599,22 @@ def solve_p2(
              "uncertified_band": (last_feas_lam, float(hi)),
              "bound": cen_tag,
              "forces_certified_by": last_feas_v.certified_by,
+             "lam_lo_feasible": float(last_feas_lam), "lam_hi": float(hi),
+             "lam_hi_verified_infeasible": False,
              "note": "hi endpoint uncertified; lambda_assoc is the last "
                      "certified-feasible lambda"},
             direction=cen_direction,
         )
 
     if s_hi == FEASIBLE:
-        # Certified feasible all the way to the cap. lambda_assoc is a cap.
+        # Certified feasible all the way to the cap. lambda_assoc is a cap and
+        # no infeasible endpoint was verified, so nothing upper-bounds true.
         return result(
             FEASIBLE, hi, None, v_hi.f * float(system.W),
             {"bracket_found": False, "censored": True, "bracket_width": 0.0,
              "bound": cen_tag, "forces_certified_by": v_hi.certified_by,
+             "lam_lo_feasible": float(hi), "lam_hi": None,
+             "lam_hi_verified_infeasible": False,
              "note": "feasible to cap; lambda_assoc is a cap"},
             direction=cen_direction,
         )
@@ -588,17 +638,22 @@ def solve_p2(
             uncertified = (float(lo), float(hi))
             break
 
+    # hi is always a verified-infeasible endpoint here (it entered the bracket
+    # infeasible and is only ever moved down to a verified-infeasible midpoint),
+    # so lam_hi upper-bounds true capacity.
     extra = {
         "bracket_found": True,
         "bracket_width": float(hi - lo),
         "load_power": (infeas_v.farkas or {}).get("load_power"),
         "forces_certified_by": feas_v.certified_by,
+        "lam_lo_feasible": float(lo), "lam_hi": float(hi),
+        "lam_hi_verified_infeasible": True,
     }
     if uncertified is not None:
         extra["uncertified_band"] = uncertified
         extra["note"] = "bisection stopped on an uncertified midpoint"
     return result(FEASIBLE, float(lo), infeas_v.mechanism,
-                  feas_v.f * float(system.W), extra)
+                  feas_v.f * float(system.W), extra, lam_upper=float(hi))
 
 
 def solve_p3(
@@ -616,9 +671,19 @@ def solve_p3(
     g_of_mu(mu) -> G rebuilds the cone matrix for a uniform friction mu, so
     the solver stays decoupled from the mechanics cone builder. Feasibility
     of P0 is monotone nondecreasing in mu, so the feasible set is
-    [mu*, inf). mu_critical_assoc is the smallest certified-feasible mu.
-    The true required friction can be higher (lower estimate). Verdicts are
-    verified; a NO_CONVERGE midpoint escalates to the exact oracle.
+    [mu*, inf). Verdicts are verified; a NO_CONVERGE midpoint escalates to
+    the exact oracle.
+
+    Two bracket endpoints are reported. mu_critical_assoc (equal to
+    mu_achievable) is the smallest friction verified feasible (the upper
+    bracket bound): achievable in the associative model, not ordered against
+    the true required friction. mu_lower_verified is the largest friction
+    verified infeasible (the lower bracket bound). Since it is verified
+    infeasible, mu_lower_verified <= mu*_assoc <= mu_true for the 2D exact
+    cone, so it lower-bounds the true required friction.
+    physical_bound_direction describes mu_lower_verified, not
+    mu_critical_assoc. info records mu_lo_infeasible, mu_hi_feasible, and
+    mu_lo_verified_infeasible.
     """
     if not (isinstance(n_iter, int) and n_iter >= 1):
         raise ValueError(f"n_iter must be an int >= 1, got {n_iter!r}")
@@ -654,6 +719,9 @@ def solve_p3(
     s_lo, v_lo = resolve(lo)
     s_hi, v_hi = resolve(hi)
     p3_direction, p3_tag = _p3_bound(system.cone)
+    # lo is a verified-infeasible endpoint only when a verified INFEASIBLE
+    # verdict put it there (the initial mu_lo, or a bisection midpoint).
+    lo_verified_infeasible = s_lo == INFEASIBLE
     info = {
         "n_iter": int(n_iter),
         "mu_lo": lo,
@@ -668,12 +736,17 @@ def solve_p3(
         info["uncertified_at_mu_lo"] = True
 
     def result(status, mu_crit, forces, extra, *, mechanism=None,
-               direction=p3_direction):
+               direction=p3_direction, mu_lower=None):
+        # mu_crit is the verified-feasible (achievable) bound; mu_lower is the
+        # verified-infeasible bound that lower-bounds true required friction
+        # in 2D. physical_bound_direction describes mu_lower.
         return Result(
             status=status,
             margin=0.0 if status == FEASIBLE else float("inf"),
             forces=forces,
             mu_critical_assoc=mu_crit,
+            mu_achievable=mu_crit,
+            mu_lower_verified=mu_lower,
             mechanism=mechanism,
             cone_model=system.cone,
             physical_bound_direction=direction,
@@ -682,10 +755,14 @@ def solve_p3(
 
     if s_lo == FEASIBLE:
         # Feasible even at the lowest mu. Forces come from the LOW endpoint.
+        # No infeasible endpoint was verified, so nothing lower-bounds true.
         return result(FEASIBLE, lo, v_lo.f * float(system.W),
                       {"note": "feasible at mu_lo; mu_critical_assoc is a lower cap",
                        "resolution": 0.0,
-                       "forces_certified_by": v_lo.certified_by})
+                       "mu_lo_infeasible": None, "mu_hi_feasible": float(lo),
+                       "mu_lo_verified_infeasible": False,
+                       "forces_certified_by": v_lo.certified_by},
+                      direction="unknown")
     if s_hi == NO_CONVERGE:
         # Could not certify the top of the range. Never report as infeasible.
         return result(NO_CONVERGE, None, None,
@@ -694,11 +771,15 @@ def solve_p3(
                       direction=None)
     if s_hi == INFEASIBLE:
         # Infeasible even at the highest mu (friction-independent collapse).
-        # No critical friction exists; carry the mechanism from mu_hi.
+        # No critical friction exists; carry the mechanism from mu_hi. mu_hi is
+        # verified infeasible, so it lower-bounds the true required friction.
         return result(INFEASIBLE, None, None,
                       {"note": "no certified feasible mu in range",
-                       "resolution": 0.0},
-                      mechanism=v_hi.mechanism, direction=None)
+                       "resolution": 0.0,
+                       "mu_lo_infeasible": float(hi), "mu_hi_feasible": None,
+                       "mu_lo_verified_infeasible": True},
+                      mechanism=v_hi.mechanism, direction=p3_direction,
+                      mu_lower=float(hi))
 
     feas_v = v_hi
     uncertified = None
@@ -710,14 +791,20 @@ def solve_p3(
             feas_v = v_mid
         elif s_mid == INFEASIBLE:
             lo = mid
+            lo_verified_infeasible = True
         else:
             uncertified = (float(lo), float(hi))
             break
     info["resolution"] = float(hi - lo)
     if uncertified is not None:
         info["uncertified_band"] = uncertified
+    mu_lower = float(lo) if lo_verified_infeasible else None
+    direction = p3_direction if lo_verified_infeasible else "unknown"
     return result(FEASIBLE, float(hi), feas_v.f * float(system.W),
-                  {"forces_certified_by": feas_v.certified_by})
+                  {"forces_certified_by": feas_v.certified_by,
+                   "mu_lo_infeasible": float(lo), "mu_hi_feasible": float(hi),
+                   "mu_lo_verified_infeasible": bool(lo_verified_infeasible)},
+                  direction=direction, mu_lower=mu_lower)
 
 
 def margin_batch(
@@ -740,7 +827,7 @@ def margin_batch(
     verdict. The Result-typed API is solve_p4 / solve_p4_batch.
     """
     (margins, _f, _r, viol, _gap, _c, _i,
-     _rs, _re, _ri, _rc) = _jit_margin_vmap(solver_tol, max_iter)(
+     _rs, _re, _ri, _rc, _sm, _dm) = _jit_margin_vmap(solver_tol, max_iter)(
         A_batch, w_batch, G_batch, eps_reg
     )
     certified = jnp.logical_and(viol <= tol_cone, jnp.isfinite(margins))
@@ -765,14 +852,14 @@ def solve_p4_batch(
     w_batch = jnp.stack([s.w_dead for s in systems])
     G_batch = jnp.stack([s.G for s in systems])
     (margins, fs, rs, viols, gaps, convs, iters,
-     rstat, req, rineq, rcomp) = _jit_margin_vmap(
+     rstat, req, rineq, rcomp, smin, dmin) = _jit_margin_vmap(
         opts.solver_tol, opts.max_iter
     )(A_batch, w_batch, G_batch, tol.eps_reg)
     results = []
     for i, system in enumerate(systems):
         v = _classify_core(
             margins[i], fs[i], rs[i], viols[i], gaps[i], convs[i], iters[i],
-            rstat[i], req[i], rineq[i], rcomp[i],
+            rstat[i], req[i], rineq[i], rcomp[i], smin[i], dmin[i],
             system.A, system.G, system.w_dead, system.dim, tol,
             want_mechanism=True,
         )

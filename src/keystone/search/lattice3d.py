@@ -75,6 +75,7 @@ with keystone.mechanics.assemble on the same scene.
 
 import functools
 import math
+import numbers
 from dataclasses import dataclass
 
 import jax
@@ -146,6 +147,65 @@ class LatticeSpec3D:
     ped_cz: float = PED_CZ
 
     def __post_init__(self):
+        # Validate the scene scalars. Sizes and rates finite and positive,
+        # friction finite and non-negative, bounds ordered, pedestal non-empty,
+        # and the pyramid facet count even and at least four.
+        if not isinstance(self.n_max, numbers.Integral) or self.n_max < 1:
+            raise ValueError(f"n_max must be an integer >= 1, got {self.n_max!r}")
+        if not (math.isfinite(self.dx) and self.dx > 0.0):
+            raise ValueError(f"dx must be finite and positive, got {self.dx}")
+        if not (math.isfinite(self.dy) and self.dy > 0.0):
+            raise ValueError(f"dy must be finite and positive, got {self.dy}")
+        if not (
+            math.isfinite(self.x_lo)
+            and math.isfinite(self.x_hi)
+            and self.x_lo < self.x_hi
+        ):
+            raise ValueError(
+                f"x bounds must be finite with x_lo < x_hi, got "
+                f"({self.x_lo}, {self.x_hi})"
+            )
+        if not (
+            math.isfinite(self.y_lo)
+            and math.isfinite(self.y_hi)
+            and self.y_lo < self.y_hi
+        ):
+            raise ValueError(
+                f"y bounds must be finite with y_lo < y_hi, got "
+                f"({self.y_lo}, {self.y_hi})"
+            )
+        if not (math.isfinite(self.mu) and self.mu >= 0.0):
+            raise ValueError(f"mu must be finite and >= 0, got {self.mu}")
+        if not (math.isfinite(self.density) and self.density > 0.0):
+            raise ValueError(
+                f"density must be finite and positive, got {self.density}"
+            )
+        if not (math.isfinite(self.g) and self.g > 0.0):
+            raise ValueError(f"g must be finite and positive, got {self.g}")
+        if not isinstance(self.k, numbers.Integral) or self.k < 4 or self.k % 2 != 0:
+            raise ValueError(f"k must be an even integer >= 4, got {self.k!r}")
+        if not (
+            math.isfinite(self.ped_left)
+            and math.isfinite(self.ped_right)
+            and self.ped_right > self.ped_left
+        ):
+            raise ValueError(
+                "pedestal x bounds must be finite with ped_left < ped_right, "
+                f"got ({self.ped_left}, {self.ped_right})"
+            )
+        if not (
+            math.isfinite(self.ped_bot)
+            and math.isfinite(self.ped_top)
+            and self.ped_top > self.ped_bot
+        ):
+            raise ValueError(
+                "pedestal y bounds must be finite with ped_bot < ped_top, got "
+                f"({self.ped_bot}, {self.ped_top})"
+            )
+        if not (math.isfinite(self.ped_cz) and self.ped_cz > 0.0):
+            raise ValueError(
+                f"ped_cz must be finite and positive, got {self.ped_cz}"
+            )
         if self.mode not in ("static", "drop"):
             raise ValueError(
                 "mode must be 'static' or 'drop' (slide is deferred in 3D "
@@ -219,7 +279,14 @@ class LatticeSpec3D:
 
     @property
     def ped_mass(self) -> float:
-        return self.density * PEDESTAL_W * PEDESTAL_D * PEDESTAL_H
+        # Mass of the actual pedestal on this spec. width and depth from the
+        # x and y bounds, height from ped_cz (bottom at 0, top at 2 * ped_cz).
+        # The default bounds reproduce PEDESTAL_W * PEDESTAL_D * PEDESTAL_H bit
+        # for bit.
+        width = self.ped_right - self.ped_left
+        depth = self.ped_top - self.ped_bot
+        height = 2.0 * self.ped_cz
+        return self.density * width * depth * height
 
     @property
     def cube_mass(self) -> float:

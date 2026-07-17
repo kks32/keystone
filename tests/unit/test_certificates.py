@@ -87,14 +87,15 @@ def offset():
 
 # --- margin_core signature --------------------------------------------------
 
-def test_margin_core_returns_eleven():
+def test_margin_core_returns_kkt_residuals():
     out = margin_core(
         jnp.asarray(A_BLOCK), jnp.asarray(W_DEAD), jnp.asarray(cone_2d(0.5)), TOL.eps_reg
     )
-    # margin_core now appends the four KKT residuals after the raw flags.
-    assert len(out) == 11
+    # margin_core appends four KKT residuals plus the slack and dual minima
+    # after the raw flags, mirroring qpax's own convergence test.
+    assert len(out) == 13
     (margin, f, r, viol, gap, converged, iters,
-     res_stat, res_eq, res_ineq, res_comp) = out
+     res_stat, res_eq, res_ineq, res_comp, slack_min, dual_min) = out
     # Recomputed residual margin is tiny for the balanced block.
     assert float(margin) <= TOL.tol_eq
     assert float(viol) <= TOL.tol_cone
@@ -103,8 +104,11 @@ def test_margin_core_returns_eleven():
     # The balanced block converges, so all four KKT residuals are tiny.
     for res in (res_stat, res_eq, res_ineq, res_comp):
         assert float(res) <= TOL.tol_gap
-    # res_ineq is the same cone violation the primal check reads.
-    assert abs(float(res_ineq) - float(viol)) <= 1e-12
+    # res_ineq is now the inequality slack equation ||G f + s_ineq - h||_inf,
+    # not the raw cone violation, so it need not equal viol.
+    # The slack and dual variables stay nonnegative at convergence.
+    assert float(slack_min) >= -TOL.tol_gap
+    assert float(dual_min) >= -TOL.tol_gap
 
 
 # --- verified verdicts ------------------------------------------------------

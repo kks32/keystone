@@ -1,36 +1,56 @@
-"""Learned priors and values for the maximum-overhang lattice search.
+"""Learned priors and values for the maximum-overhang lattice search (v3).
 
-This trains an AlphaZero-style network that shapes the PUCT search in
-keystone.search and measures whether it reaches a target overhang in fewer
-simulations than the uniform-prior search. Certification is unchanged: the
-network only steers exploration, and every reported best sequence is
-re-verified step by step on the certified host pipeline.
+This trains an AlphaZero-style distillation network that shapes the PUCT
+search in keystone.search and measures whether it reaches a target overhang in
+fewer simulations than the uniform-prior search. "AlphaZero-style
+distillation" is the precise claim: PUCT with learned policy and value heads,
+supervised on tree visit distributions. There are no independent stochastic
+self-play games; data comes from search trees, and prior to v3 those trees
+were fully deterministic. Certification is unchanged: the network only steers
+exploration, and every reported best sequence is re-verified step by step on
+the certified host pipeline.
 
-Value targets are per-state, not one constant per episode. Imitation prefixes
-carry the suffix-max overhang of their trajectory; self-play nodes carry the
-subtree-max overhang reachable from that node. A third network head regresses
-the certified P4 margin the search already computed, an auxiliary signal that
-never feeds the search. See keystone.search.az.
+v3 fixes five experimental-validity defects of the v2 protocol:
+
+1. Seeds are real. The search RNG now drives PUCT tie-breaking jitter, and
+   data-collection searches add root Dirichlet noise. v2's five "seeds" were
+   five identical deterministic runs, so each v2 median was one measurement.
+2. Exact-n reporting. best-at-any-depth conflated block counts (v2's "n=6
+   reached 1.25" was a four-block design). v3 reports best_exact_n and
+   best_at_most_n separately and labels every row; headline claims use
+   exact-n.
+3. Root features carry the horizon. The v2 empty-root feature vector was
+   identical for every n, so the net could not condition on target size at
+   the root. v3 adds n / N_MAX_GLOBAL and log-scale block count and retrains
+   from scratch.
+4. DAG-correct value targets. Subtree-max targets aggregate over all stored
+   parents of each transposition, not the first one.
+5. The auxiliary head regresses the lateral-reserve capacity
+   min(|lam+|, |lam-|) (the quantity calibrated to predict physical
+   survival) instead of the near-constant P4 equilibrium residual.
+   --aux margin reproduces the old target for comparison.
 
 Two modes:
 
   python examples/az_overhang.py --train
-      Collect imitation and self-play data on the lattice, train two shared
-      networks (per-state value, and value plus the margin head), and
-      checkpoint them to out/search/az_params_v2*.msgpack.
+      Collect imitation and distillation data on the lattice, train two
+      shared networks (per-state value, and value plus the reserve auxiliary
+      head), and checkpoint them to out/search/az_params_v3*.msgpack.
 
   python examples/az_overhang.py --eval
-      For n = 4 and n = 6 at dx = 1/12, report simulations-to-target as the
-      median over five seeds under four conditions: uniform priors, learned
-      priors, learned priors plus the per-state value head, and that plus the
-      margin auxiliary head. Add a transfer row at n = 5, a size held out of
-      all training, and an n = 6 overshoot probe.
+      For n = 4 and n = 6 at dx = 1/12, report simulations-to-target as
+      median and min..max over five genuinely different seeds under four
+      conditions: uniform priors, learned priors, learned priors plus value
+      head, and that plus the reserve auxiliary head. Targets are exact-n
+      (a target for n cubes means best among states using exactly n cubes);
+      the at-most-n crossing is reported alongside for comparison with v2.
+      A transfer row at n = 5 is included with its leakage caveat stated.
 
 The network covers several stack sizes through one canonical layer-major
 action grid (see keystone.search.az). Training uses n in {4, 6}; n = 5 is
-never trained, so its row is a zero-shot transfer test. dx = 1/12 keeps the
-per-simulation cost low enough to run on one CPU core; dx = 1/24 evaluation is
-out of scope here.
+never trained on directly, but see the eval banner for what the n = 5 row
+does and does not show. dx = 1/12 keeps the per-simulation cost low enough
+to run on one CPU core; dx = 1/24 evaluation is out of scope here.
 """
 
 import argparse
@@ -59,15 +79,21 @@ SEARCH_ITER = 50
 MU = LT.MU
 
 OUT_DIR = "out/search"
-# v2 checkpoints. The value model uses per-state value targets only; the
-# margin model adds the auxiliary margin head. Both back the eval conditions.
-PARAMS_V2_VALUE = os.path.join(OUT_DIR, "az_params_v2_value.msgpack")
-PARAMS_V2 = os.path.join(OUT_DIR, "az_params_v2.msgpack")
+# v3 checkpoints. The value model uses per-state value targets only; the
+# reserve model adds the auxiliary lateral-reserve head. Both back the eval
+# conditions. --aux margin writes the legacy-target comparison checkpoint.
+PARAMS_V3_VALUE = os.path.join(OUT_DIR, "az_params_v3_value.msgpack")
+PARAMS_V3 = os.path.join(OUT_DIR, "az_params_v3.msgpack")
+PARAMS_V3_MARGIN = os.path.join(OUT_DIR, "az_params_v3_margin.msgpack")
 
 # Bootstrap simulation budgets per training size. Small: enough to surface a
 # few good sequences and a tree to distill, not a full solve.
 BOOTSTRAP_SIMS = {4: 1200, 5: 1500, 6: 1500}
 TRAIN_NS = (4, 6)  # n = 5 held out for the transfer row
+
+# Cap on distinct states given reserve targets per training run, bounding the
+# extra certified solves at 2 * az.RESERVE_GRID * RESERVE_MAX_STATES.
+RESERVE_MAX_STATES = 1200
 
 
 # --- certified host re-verification (identical to the fast example) --------
@@ -119,21 +145,54 @@ def print_verification(label, seq, dx, tol):
 
 
 def run_uniform_search(n, sims, seed, tol):
-    """A uniform-prior search used to bootstrap imitation and self-play data."""
-    s = Search(n, DX, tol, seed=seed, batch=K_BATCH, search_iter=SEARCH_ITER)
+    """A uniform-prior search used to bootstrap imitation and distillation data.
+
+    Data collection turns root Dirichlet noise on so different seeds explore
+    genuinely different root actions. Evaluation searches never set it.
+    """
+    s = Search(n, DX, tol, seed=seed, batch=K_BATCH, search_iter=SEARCH_ITER,
+               root_noise=True)
     s.run(sims)
     return s
 
 
 def run_learned_search(n, sims, seed, tol, model):
-    """A search steered by the model, used to collect fresh self-play data."""
+    """A search steered by the model, used to collect fresh distillation data.
+
+    Root noise on, as in run_uniform_search: collection explores, eval does not.
+    """
     s = Search(
         n, DX, tol, seed=seed, batch=K_BATCH, search_iter=SEARCH_ITER,
         prior_fn=az.make_prior_fn(model, n),
         value_fn=az.make_value_fn(model, n),
+        root_noise=True,
     )
     s.run(sims)
     return s
+
+
+def attach_reserves(samples, tol, budget_state):
+    """Attach lateral-reserve targets to rows that lack one, tracking cost.
+
+    budget_state is a dict carrying solves, wall, and states_done across
+    calls, so the total extra-solve cost of reserve supervision is bounded by
+    RESERVE_MAX_STATES distinct states per training run and reported once.
+    """
+    pending = [smp for smp in samples if smp.reserve is None]
+    room = RESERVE_MAX_STATES - budget_state["states_done"]
+    if not pending or room <= 0:
+        return
+    n_solves, wall = az.attach_reserve_targets(
+        pending, tol, dx=DX, solver_tol=1e-9, max_iter=SEARCH_ITER,
+        max_states=room,
+    )
+    filled = sum(1 for smp in pending if smp.reserve is not None)
+    budget_state["solves"] += n_solves
+    budget_state["wall"] += wall
+    budget_state["states_done"] += n_solves // (2 * az.RESERVE_GRID)
+    print(f"  reserve targets: +{filled} rows, {n_solves} directional solves, "
+          f"{wall:.1f}s (cumulative {budget_state['solves']} solves, "
+          f"{budget_state['wall']:.1f}s)")
 
 
 def _value_loss_trajectory(hist):
@@ -142,28 +201,37 @@ def _value_loss_trajectory(hist):
 
 
 def train_variant(name, fs, replay_seed, phase1, imit, selfplay_boot, tol,
-                  model, margin_weight, robust, args):
+                  model, margin_weight, robust, args, aux_mode="reserve",
+                  budget_state=None):
     """Train one model through phase 1 and the self-play rounds.
 
-    margin_weight scales the auxiliary margin loss; 0.0 disables the head's
-    supervision. robust switches the value target to the knife-edge-penalized
-    variant. Returns the phase-1 and last self-play histories for reporting.
+    margin_weight scales the auxiliary loss; 0.0 disables the head's
+    supervision. aux_mode picks the auxiliary target: "reserve" (the lateral
+    reserve capacity, the v3 default) or "margin" (the legacy equilibrium
+    residual, kept for comparison). robust switches the value target to the
+    knife-edge-penalized variant. Returns the phase-1 and last self-play
+    histories for reporting.
     """
-    f1, p1, v1, m1, mg1, mgm1 = az.assemble_arrays(fs, phase1)
+    needs_reserve = margin_weight > 0.0 and aux_mode == "reserve"
+    if needs_reserve:
+        attach_reserves(phase1, tol, budget_state)
+    f1, p1, v1, m1, mg1, mgm1 = az.assemble_arrays(fs, phase1,
+                                                   aux_mode=aux_mode)
     print(f"  [{name}] phase-1 value-target std={float(v1.std()):.4f} "
-          f"margin rows={int(mgm1.sum())}/{len(phase1)}")
+          f"aux[{aux_mode}] rows={int(mgm1.sum())}/{len(phase1)} "
+          f"target std={float(mg1[mgm1].std()) if mgm1.any() else 0.0:.4f}")
     h1 = az.train(model, f1, p1, v1, m1, mg1, mgm1,
                   steps=args.imit_steps, batch=256, lr=3e-4,
                   margin_weight=margin_weight, seed=0)
     print(f"  [{name}] phase-1 train: {args.imit_steps} steps "
           f"loss {h1[0]['loss']:.4f} -> {h1[-1]['loss']:.4f} "
           f"(policy {h1[-1]['policy']:.4f} value {h1[-1]['value']:.2e} "
-          f"margin {h1[-1]['margin']:.2e})")
+          f"aux {h1[-1]['margin']:.2e})")
     print(f"  [{name}] phase-1 value loss: {_value_loss_trajectory(h1)}")
 
     # Self-play rounds: run the learned search under this model's own hooks,
-    # distil visit distributions with per-state subtree-max value targets and
-    # threaded margins, add to the replay buffer, and retrain.
+    # distil visit distributions with per-state DAG subtree-max value targets,
+    # add to the replay buffer, and retrain.
     replay = list(imit) + list(selfplay_boot)
     h2 = h1
     for r in range(args.sp_rounds):
@@ -174,15 +242,19 @@ def train_variant(name, fs, replay_seed, phase1, imit, selfplay_boot, tol,
                                       robust_penalty=args.robust_penalty)
             replay += new
             print(f"  [{name}] selfplay round {r + 1} n={n}: "
-                  f"best={s.best_overhang:.4f} rows+={len(new)} "
+                  f"best_exact={s.exact_overhang(n):.4f} "
+                  f"best_any={s.best_overhang:.4f} rows+={len(new)} "
                   f"buffer={len(replay)}")
-        f2, p2, v2, m2, mg2, mgm2 = az.assemble_arrays(fs, replay)
+        if needs_reserve:
+            attach_reserves(replay, tol, budget_state)
+        f2, p2, v2, m2, mg2, mgm2 = az.assemble_arrays(fs, replay,
+                                                       aux_mode=aux_mode)
         h2 = az.train(model, f2, p2, v2, m2, mg2, mgm2,
                       steps=args.sp_steps, batch=256, lr=3e-4,
                       margin_weight=margin_weight, seed=r + 1)
         print(f"  [{name}] selfplay round {r + 1} train: {args.sp_steps} steps "
               f"loss {h2[0]['loss']:.4f} -> {h2[-1]['loss']:.4f} "
-              f"(value {h2[-1]['value']:.2e} margin {h2[-1]['margin']:.2e})")
+              f"(value {h2[-1]['value']:.2e} aux {h2[-1]['margin']:.2e})")
     print(f"  [{name}] final self-play value loss: {_value_loss_trajectory(h2)}")
     return h1, h2
 
@@ -191,10 +263,12 @@ def do_train(args):
     os.makedirs(OUT_DIR, exist_ok=True)
     tol = Tolerances()
     fs = az.make_feature_spec(dx=DX, max_layers=MAX_LAYERS)
-    print(f"train v2: dx=1/{round(1 / DX)} max_layers={MAX_LAYERS} "
+    print(f"train v3: dx=1/{round(1 / DX)} max_layers={MAX_LAYERS} "
           f"M={fs.M} F={fs.F} train_ns={list(TRAIN_NS)} (n=5 held out)")
-    print(f"  per-state value targets (suffix/subtree-max), margin_weight="
-          f"{args.margin_weight}, robust={bool(args.robust)}")
+    print(f"  per-state value targets (suffix/DAG-subtree-max), aux="
+          f"{args.aux} weight={args.margin_weight}, robust={bool(args.robust)}")
+    print(f"  root features carry n / {az.N_MAX_GLOBAL} and log-scale count; "
+          f"data-collection searches use tie jitter + root Dirichlet noise")
 
     # Imitation records: the known-good seeds, any external optima, and the
     # best sequence of a uniform bootstrap search per training size.
@@ -208,6 +282,19 @@ def do_train(args):
           f"(bnb_optima.json present: "
           f"{os.path.exists(os.path.join(OUT_DIR, 'bnb_optima.json'))})")
 
+    # Hold-out hygiene. External optima files carry records labeled n=5 (and
+    # n=6 rows whose sequence is a 4-cube design). Now that the root features
+    # carry the horizon, an n=5-labeled imitation row would train exactly the
+    # conditioning the transfer row claims is held out, so every record whose
+    # n is not a training size is dropped. Records whose sequence uses fewer
+    # cubes than n are dropped too: imitating a 4-cube build as an "n=6"
+    # episode is the block-count conflation this revision removes.
+    before = len(records)
+    records = [r for r in records
+               if r["n"] in TRAIN_NS and len(r["seq"]) == r["n"]]
+    print(f"  hold-out filter: kept {len(records)}/{before} records "
+          f"(train sizes {list(TRAIN_NS)}, exact-length sequences only)")
+
     # Bootstrap uniform searches. These are the shared data source for both
     # variants: same searches, same seeds, so the only difference downstream is
     # the training objective.
@@ -215,14 +302,18 @@ def do_train(args):
     t0 = time.perf_counter()
     for n in TRAIN_NS:
         sims = BOOTSTRAP_SIMS[n]
-        s = run_uniform_search(n, sims, seed=0, tol=tol)
-        seq = s.best_sequence()
-        records.append({"n": n, "dx": DX, "seq": seq})
+        s = run_uniform_search(n, sims, seed=n, tol=tol)
+        # Imitate the best exact-n build, not the best-at-any-depth design;
+        # a shorter design would smuggle the block-count conflation back in.
+        seq = s.exact_sequence(n)
+        if seq:
+            records.append({"n": n, "dx": DX, "seq": seq})
         sp = az.selfplay_samples(fs, s, robust=bool(args.robust),
                                  robust_penalty=args.robust_penalty)
         selfplay_boot += sp
         print(f"  bootstrap n={n}: sims={s.sims_done} "
-              f"best_overhang={s.best_overhang:.4f} selfplay_rows={len(sp)} "
+              f"best_exact={s.exact_overhang(n):.4f} "
+              f"best_any={s.best_overhang:.4f} selfplay_rows={len(sp)} "
               f"({time.perf_counter() - t0:.0f}s elapsed)")
 
     imit, dropped = az.imitation_samples(fs, records)
@@ -233,23 +324,35 @@ def do_train(args):
     phase1 = list(imit) + list(selfplay_boot)
     print(f"  phase-1 dataset: {len(phase1)} rows")
 
-    # Value model: per-state value targets, no margin supervision.
+    # Reserve-solve budget, shared across the aux variant's attach calls.
+    budget = {"solves": 0, "wall": 0.0, "states_done": 0}
+
+    # Value model: per-state value targets, no auxiliary supervision.
     value_model = az.AZModel(fs, init_seed=args.init_seed)
     train_variant("value", fs, 0, phase1, imit, selfplay_boot, tol,
                   value_model, margin_weight=0.0, robust=bool(args.robust),
                   args=args)
-    az.save_params(value_model, PARAMS_V2_VALUE)
-    print(f"  wrote {PARAMS_V2_VALUE}")
+    az.save_params(value_model, PARAMS_V3_VALUE)
+    print(f"  wrote {PARAMS_V3_VALUE}")
 
-    # Margin-aux model: same per-state value targets plus the auxiliary margin
-    # head trained on the certified margins the search already computed.
-    margin_model = az.AZModel(fs, init_seed=args.init_seed)
-    train_variant("margin-aux", fs, 0, phase1, imit, selfplay_boot, tol,
-                  margin_model, margin_weight=args.margin_weight,
-                  robust=bool(args.robust), args=args)
-    az.save_params(margin_model, PARAMS_V2)
-    print(f"  wrote {PARAMS_V2}")
+    # Aux model: same per-state value targets plus the auxiliary head. The
+    # default target is the lateral-reserve capacity computed by the batched
+    # reserve kernel on buffer states (cost reported); --aux margin reproduces
+    # the legacy equilibrium-residual target for comparison.
+    aux_name = "reserve-aux" if args.aux == "reserve" else "margin-aux(legacy)"
+    aux_path = PARAMS_V3 if args.aux == "reserve" else PARAMS_V3_MARGIN
+    aux_model = az.AZModel(fs, init_seed=args.init_seed)
+    train_variant(aux_name, fs, 0, phase1, imit, selfplay_boot, tol,
+                  aux_model, margin_weight=args.margin_weight,
+                  robust=bool(args.robust), args=args, aux_mode=args.aux,
+                  budget_state=budget)
+    az.save_params(aux_model, aux_path)
+    print(f"  wrote {aux_path}")
 
+    if args.aux == "reserve":
+        print(f"  reserve supervision cost: {budget['solves']} directional "
+              f"certified solves, {budget['wall']:.1f}s wall "
+              f"(cap {RESERVE_MAX_STATES} states, grid {az.RESERVE_GRID})")
     print(f"  total train wall: {time.perf_counter() - t0:.0f}s")
     return 0
 
@@ -258,94 +361,83 @@ def do_train(args):
 
 
 def sims_to_targets(n, targets, cap, seed, tol, prior_fn=None, value_fn=None):
-    """Simulations until best_overhang first reaches each target, or None.
+    """Simulations until the exact-n and at-most-n bests reach each target.
 
     Runs one batched iteration at a time so the first crossing is caught at
-    K-simulation resolution. Runs until every target is crossed or the cap is
-    hit. Returns (reached_dict, best_seen, search) where reached_dict maps each
-    target to its crossing sim count or None.
+    K-simulation resolution, until both crossing sets are complete or the cap
+    is hit. Evaluation searches use the seeded tie jitter only: no root noise,
+    no sampling temperature.
+
+    Returns (reached_exact, reached_atmost, best_exact, best_atmost, search).
+    reached_exact[t] is the sim count at which the best overhang among states
+    using exactly n cubes first reached t (None if never); reached_atmost[t]
+    is the same for the best at any block count <= n, the old v2 semantics.
     """
     s = Search(n, DX, tol, seed=seed, batch=K_BATCH, search_iter=SEARCH_ITER,
                prior_fn=prior_fn, value_fn=value_fn)
     n_iter = max(1, math.ceil(cap / K_BATCH))
-    reached = {t: None for t in targets}
-    remaining = set(targets)
+    reached_exact = {t: None for t in targets}
+    reached_atmost = {t: None for t in targets}
     it = 0
     for it in range(n_iter):
         s.run_iteration()
-        done = [t for t in remaining if s.best_overhang >= t - 1e-9]
-        for t in done:
-            reached[t] = (it + 1) * K_BATCH
-            remaining.discard(t)
-        if not remaining:
+        sims = (it + 1) * K_BATCH
+        be = s.exact_overhang(n)
+        ba = s.best_overhang
+        for t in targets:
+            if reached_exact[t] is None and be >= t - 1e-9:
+                reached_exact[t] = sims
+            if reached_atmost[t] is None and ba >= t - 1e-9:
+                reached_atmost[t] = sims
+        if (all(v is not None for v in reached_exact.values())
+                and all(v is not None for v in reached_atmost.values())):
             break
+        if s.root["solved"]:
+            break  # tree exhausted; nothing further can be reached
     s.sims_done = (it + 1) * K_BATCH
-    best = s.best_overhang if s.best_overhang != float("-inf") else 0.0
-    return reached, best, s
+    best_exact = s.exact_overhang(n)
+    best_exact = 0.0 if best_exact == float("-inf") else best_exact
+    best_atmost = s.best_overhang if s.best_overhang != float("-inf") else 0.0
+    return reached_exact, reached_atmost, best_exact, best_atmost, s
 
 
 def eval_condition(n, targets, cap, seeds, tol, make_hooks):
-    """Run one condition over seeds. Returns (per_seed_reached, bests, searches).
+    """Run one condition over seeds.
 
-    make_hooks(n) -> (prior_fn, value_fn). per_seed_reached[i] is the reached
-    dict for seed i; bests[i] is its best overhang; searches[i] is the search.
+    make_hooks(n) -> (prior_fn, value_fn). Returns a dict of aligned per-seed
+    lists: reached_exact, reached_atmost, best_exact, best_atmost, searches.
     """
-    per_seed, bests, searches = [], [], []
+    out = {"reached_exact": [], "reached_atmost": [], "best_exact": [],
+           "best_atmost": [], "searches": []}
     for seed in seeds:
         prior_fn, value_fn = make_hooks(n)
-        reached, best, s = sims_to_targets(n, targets, cap, seed, tol,
-                                           prior_fn=prior_fn, value_fn=value_fn)
-        per_seed.append(reached)
-        bests.append(best)
-        searches.append(s)
-    return per_seed, bests, searches
+        re_, ra, be, ba, s = sims_to_targets(n, targets, cap, seed, tol,
+                                             prior_fn=prior_fn,
+                                             value_fn=value_fn)
+        out["reached_exact"].append(re_)
+        out["reached_atmost"].append(ra)
+        out["best_exact"].append(be)
+        out["best_atmost"].append(ba)
+        out["searches"].append(s)
+    return out
 
 
 def summarize_target(per_seed, target, cap):
-    """Median sims-to-target and reached-count. Not-reached counts as cap."""
+    """(median, min, max, reached-count) of sims-to-target across seeds.
+
+    Not-reached counts as cap in the median and the spread, so a cell with
+    reached < len(seeds) understates the true cost; the reached count is
+    printed next to it.
+    """
     vals = [d[target] for d in per_seed]
     filled = [v if v is not None else cap for v in vals]
     reached = sum(1 for v in vals if v is not None)
-    return statistics.median(filled), reached
+    return statistics.median(filled), min(filled), max(filled), reached
 
 
-def overshoot_probe(conditions, tol, cap, seeds):
-    """n = 6 overshoot probe: sims to reach 1.25 and 1.3333 past the 1.1667 target.
-
-    Learned conditions only. Mirrors the supplementary probe in the prior run
-    so the two runs stay comparable.
-    """
-    print(f"=== supplementary n=6 overshoot probe (learned only, cap {cap}, "
-          f"seeds {seeds}) ===")
-    print(f"n=6 overshoot probe, cap {cap} seeds {seeds}")
-    targets = [1.25, 4.0 / 3.0]
-    header = (f"{'condition':>22}   {'->1.25':>10} {'->1.3333':>10} "
-              f"{'med_best':>9}")
-    print(header)
-    verify = []
-    for (name, hooks) in conditions:
-        if name == "uniform":
-            continue
-        per_seed, bests, searches = eval_condition(6, targets, cap, seeds, tol,
-                                                   hooks)
-        med_best = statistics.median(bests)
-        cells = []
-        for t in targets:
-            med, reached = summarize_target(per_seed, t, cap)
-            cells.append(f"{med:.0f}({reached}/{len(seeds)})")
-        print(f"{name:>22}   {cells[0]:>10} {cells[1]:>10} {med_best:>9.4f}")
-        pick = searches[int(max(range(len(bests)), key=lambda i: bests[i]))]
-        verify.append((name, pick.best_sequence(), pick.best_overhang))
-    print("host re-verification of best n=6 sequences:")
-    for (name, seq, best) in verify:
-        if not seq:
-            print(f"  {name} best={best:.4f}: no sequence")
-            continue
-        trace = verify_sequence(seq, DX, tol)
-        ok = all(status == "feasible" for (_L, _j, _x, _m, status) in trace)
-        edge = max(x + 0.5 for (_L, _j, x, _m, _s) in trace)
-        print(f"  {name} best={best:.4f}: prefix_feasible={ok} "
-              f"rightmost_edge={edge:.4f} steps={len(seq)}")
+def spread(vals):
+    """(median, min, max) of a list of floats."""
+    return statistics.median(vals), min(vals), max(vals)
 
 
 def do_eval(args):
@@ -353,14 +445,15 @@ def do_eval(args):
     fs = az.make_feature_spec(dx=DX, max_layers=MAX_LAYERS)
     seeds = list(range(args.seeds))
 
-    # Load the two v2 models. The value model uses per-state value targets
-    # only; the margin model adds the auxiliary margin head during training.
-    # The margin head never feeds the search, so any difference between the two
-    # is the auxiliary task reshaping the shared prior and value heads.
+    # Load the two v3 models. The value model uses per-state value targets
+    # only; the reserve model adds the auxiliary lateral-reserve head during
+    # training. The auxiliary head never feeds the search, so any difference
+    # between the two is the auxiliary task reshaping the shared prior and
+    # value heads.
     value_model = az.AZModel(fs, init_seed=args.init_seed)
-    az.load_params(value_model, PARAMS_V2_VALUE)
-    margin_model = az.AZModel(fs, init_seed=args.init_seed)
-    az.load_params(margin_model, PARAMS_V2)
+    az.load_params(value_model, PARAMS_V3_VALUE)
+    aux_model = az.AZModel(fs, init_seed=args.init_seed)
+    az.load_params(aux_model, PARAMS_V3)
 
     # Conditions. Each maps a size n to (prior_fn, value_fn).
     def uniform_hooks(n):
@@ -372,38 +465,48 @@ def do_eval(args):
     def prior_value_hooks(n):
         return az.make_prior_fn(value_model, n), az.make_value_fn(value_model, n)
 
-    def prior_value_margin_hooks(n):
-        return (az.make_prior_fn(margin_model, n),
-                az.make_value_fn(margin_model, n))
+    def prior_value_reserve_hooks(n):
+        return (az.make_prior_fn(aux_model, n),
+                az.make_value_fn(aux_model, n))
 
     conditions = [
         ("uniform", uniform_hooks),
         ("prior", prior_only_hooks),
-        ("prior+value(new)", prior_value_hooks),
-        ("prior+value+margin-aux", prior_value_margin_hooks),
+        ("prior+value", prior_value_hooks),
+        ("prior+value+reserve-aux", prior_value_reserve_hooks),
     ]
 
-    # Targets per size, on the dx = 1/12 grid (edges are j/12 + 0.5).
-    # n = 4: bnb certifies the optimum at 1.25 (j = 9). The task target 7/6 =
-    #   1.1667 (j = 8) is that optimum minus one grid step, so we report both.
-    # n = 6: 1.1667 is the reachable target of prior uniform runs.
-    # n = 5 (transfer, held out of training): 1.0833 (j = 7).
-    OPT4 = 1.25
+    # Targets per size, on the dx = 1/12 grid (edges are j/12 + 0.5). All
+    # headline rows are exact-n: a target for n cubes means best among states
+    # using exactly n cubes. The at-most-n crossing (v2's semantics) is
+    # printed alongside for comparison.
+    # n = 4: 7/6 (the task target) and 1.25, the bnb-certified exact-4
+    #   optimum and current best-known.
+    # n = 6: 1.25 and 4/3, both beating 1.225 with exactly six cubes. v2's
+    #   "n=6 reached 1.25" was a four-block design; these rows cannot be
+    #   satisfied that way.
+    # n = 5 (transfer): 1.0833 (j = 7).
     tasks = [
-        (4, [7.0 / 6.0, OPT4], args.cap_n4, False),
-        (6, [1.0 + 2.0 / 12.0], args.cap_n6, False),
+        (4, [7.0 / 6.0, 1.25], args.cap_n4, False),
+        (6, [1.25, 4.0 / 3.0], args.cap_n6, False),
         (5, [1.0 + 1.0 / 12.0], args.cap_n5, True),
     ]
 
-    print(f"eval v2: seeds={seeds} caps n4={args.cap_n4} n6={args.cap_n6} "
+    print(f"eval v3: seeds={seeds} caps n4={args.cap_n4} n6={args.cap_n6} "
           f"n5={args.cap_n5}")
-    print(f"grid dx=1/{round(1 / DX)}; n=4 optimum 1.25 is bnb-certified; "
-          f"n=5 is a held-out transfer size")
-    print("conditions compare per-state value (new) and the margin auxiliary "
-          "head against uniform and prior-only")
+    print(f"grid dx=1/{round(1 / DX)}; n=4 exact-4 optimum 1.25 is "
+          f"bnb-certified; headline rows are exact-n")
+    print("seeds are genuinely different runs (seeded PUCT tie jitter); "
+          "eval uses no root noise and argmax moves")
+    print("n=5 transfer caveat: n=5 was never a search size during training, "
+          "but training data included n=4 and n=6 sequences over the same "
+          "shared action grid, and 4- and 5-cube prefixes of n=6 episodes "
+          "are in the buffer. The n=5 row therefore shows generalization "
+          "across the horizon input, not performance on unseen states.")
     print("")
-    header = (f"{'n':>3} {'target':>8} {'condition':>24} {'median_sims':>12} "
-              f"{'reached':>9} {'med_best':>9}")
+    header = (f"{'n':>3} {'target':>8} {'scope':>8} {'condition':>24} "
+              f"{'med_sims':>9} {'min..max':>13} {'reached':>8} "
+              f"{'med_best':>9} {'best min..max':>15}")
     print(header)
     print("-" * len(header))
 
@@ -411,25 +514,31 @@ def do_eval(args):
     for (n, targets, cap, transfer) in tasks:
         tag = "transfer" if transfer else "target"
         for (name, hooks) in conditions:
-            per_seed, bests, searches = eval_condition(
-                n, targets, cap, seeds, tol, hooks)
-            med_best = statistics.median(bests)
+            res = eval_condition(n, targets, cap, seeds, tol, hooks)
+            med_be, lo_be, hi_be = spread(res["best_exact"])
+            med_ba, lo_ba, hi_ba = spread(res["best_atmost"])
             for t in targets:
-                med, reached = summarize_target(per_seed, t, cap)
-                print(f"{n:>3} {t:>8.4f} {name:>24} {med:>12.0f} "
-                      f"{reached:>4}/{len(seeds):<3} {med_best:>9.4f}")
-            # Re-verify the best sequence of the seed with the highest overhang.
-            pick = searches[int(max(range(len(bests)), key=lambda i: bests[i]))]
-            verify_jobs.append((f"n={n} {name} {tag}", n, pick.best_sequence(),
-                               pick.best_overhang))
+                for scope, per_seed, mb, lo_b, hi_b in (
+                    ("exact-n", res["reached_exact"], med_be, lo_be, hi_be),
+                    ("<=n", res["reached_atmost"], med_ba, lo_ba, hi_ba),
+                ):
+                    med, lo, hi, reached = summarize_target(per_seed, t, cap)
+                    print(f"{n:>3} {t:>8.4f} {scope:>8} {name:>24} "
+                          f"{med:>9.0f} {f'{lo:.0f}..{hi:.0f}':>13} "
+                          f"{reached:>4}/{len(seeds):<3} {mb:>9.4f} "
+                          f"{f'{lo_b:.4f}..{hi_b:.4f}':>15}")
+            # Re-verify the exact-n best sequence of the best seed.
+            bests = res["best_exact"]
+            pick = res["searches"][
+                int(max(range(len(bests)), key=lambda i: bests[i]))]
+            verify_jobs.append((f"n={n} {name} {tag} exact-{n}", n,
+                                pick.exact_sequence(n), pick.exact_overhang(n)))
         print("")
 
-    overshoot_probe(conditions, tol, args.cap_overshoot, list(range(3)))
-    print("")
-
-    print("certified host re-verification of reported best sequences:")
+    print("certified host re-verification of reported exact-n best sequences:")
     for (label, n, seq, best) in verify_jobs:
-        print(f"  [{label}] search_best={best:.4f}")
+        best_s = "none" if best == float("-inf") else f"{best:.4f}"
+        print(f"  [{label}] search_best={best_s}")
         print_verification("    host", seq, DX, tol)
     return 0
 
@@ -453,16 +562,18 @@ def main():
     parser.add_argument("--seeds", type=int, default=5,
                         help="number of eval seeds")
     parser.add_argument("--margin_weight", type=float, default=0.5,
-                        help="weight on the auxiliary margin loss")
+                        help="weight on the auxiliary loss")
+    parser.add_argument("--aux", choices=["reserve", "margin"],
+                        default="reserve",
+                        help="auxiliary target: lateral reserve (v3 default) "
+                             "or the legacy P4 residual margin")
     parser.add_argument("--robust", action="store_true",
                         help="use the knife-edge-penalized value target")
     parser.add_argument("--robust_penalty", type=float, default=0.05,
                         help="value penalty for knife-edge best paths")
-    parser.add_argument("--cap_n4", type=int, default=4000)
-    parser.add_argument("--cap_n5", type=int, default=3000)
-    parser.add_argument("--cap_n6", type=int, default=6000)
-    parser.add_argument("--cap_overshoot", type=int, default=1200,
-                        help="cap for the n=6 overshoot probe")
+    parser.add_argument("--cap_n4", type=int, default=3000)
+    parser.add_argument("--cap_n5", type=int, default=2500)
+    parser.add_argument("--cap_n6", type=int, default=4000)
     args = parser.parse_args()
 
     if not args.train and not args.eval:

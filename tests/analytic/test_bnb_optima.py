@@ -12,9 +12,20 @@ pipeline (build_assembly + assemble + solve_p0) and pin two facts: every
 prefix is statically feasible, and the rightmost cube edge equals the
 certified optimum. Placement-mode optima (drop, slide) are additionally
 re-checked step by step with bnb.sequence_reachable in their recorded
-order. One short live n=3 static run pins the pre-reachability node counts
-bitwise; everything else is a replay. Only certified optima are archived
-here; intervals from budget-limited runs are recorded in out/search only.
+order. One short live n=3 static run pins the sound three-state screen's
+counts and its interval claim bitwise; everything else is a replay.
+
+Three-state soundness note. The screen classifies each child as
+verified-feasible, candidate-infeasible, or unknown, and a child is
+permanently discarded only after the exact LP path verifies infeasibility.
+Under that discipline the n=3 static run at dx=1/12 no longer claims a
+point optimum: the set {(0,-4), (1,-1), (2,5)} reaches 11/12 and is
+strictly feasible by the exact LP (residual at machine precision), but the
+interior-point host pipeline at its default iteration cap cannot confirm
+its build order, so the run reports the interval [5/6, 11/12] with one
+unresolved state. Boundary states can be undecidable at tolerance, and the
+sound answer is then an interval, never a point. The n=4 dx=1/12 static
+optimum 5/4 survives as a full proof (no unresolved states).
 
 Scene (CLAUDE.md Section 4, 2D xz plane, gravity along -z). A pedestal
 box_2d(6, 1, -3, 0.5) puts its right edge at x = 0 and its top at z = 1.
@@ -228,14 +239,20 @@ def test_bnb_static_short_run_matches_prechange_counts():
     # before the flag existed, node for node and solve for solve.
     res = bnb.certify(3, 1.0 / 12.0, TOL, opts=SolverOptions(), progress=False)
     assert res.placement == "static"
-    assert res.certified and res.stop_reason == "optimal"
+    # Sound tri-state semantics: the harmonic boundary state at 11/12 is
+    # undecidable at tolerance, so n=3 reports the interval [5/6, 11/12]
+    # with one unresolved state rather than a point optimum.
+    assert not res.certified and res.stop_reason == "unresolved"
     assert abs(res.optimum - 5.0 / 6.0) < 1e-9
+    assert abs(res.lower - 5.0 / 6.0) < 1e-9
+    assert abs(res.upper - 11.0 / 12.0) < 1e-9
+    assert res.info["unresolved_states"] == [((0, -4), (1, -1), (2, 5))]
     assert [tuple(a) for a in res.sequence] == [(0, -4), (1, 0), (2, 4)]
     assert res.nodes_expanded == 254
     assert res.nodes_generated == 1085
     assert res.qp_solves == 2002
     assert res.closed_size == 254
-    assert res.host_verifications == 5
+    assert res.host_verifications == 6
     assert res.host_verified
 
 
@@ -250,14 +267,20 @@ def test_bnb_equal_materials_match_default_baseline():
         mu=0.7, densities=(2000.0, 2000.0, 2000.0),
         mu_by_slot=(0.7, 0.7, 0.7), mu_ground=0.7,
     )
-    assert res.certified and res.stop_reason == "optimal"
+    # Sound tri-state semantics: the harmonic boundary state at 11/12 is
+    # undecidable at tolerance, so n=3 reports the interval [5/6, 11/12]
+    # with one unresolved state rather than a point optimum.
+    assert not res.certified and res.stop_reason == "unresolved"
     assert abs(res.optimum - 5.0 / 6.0) < 1e-9
+    assert abs(res.lower - 5.0 / 6.0) < 1e-9
+    assert abs(res.upper - 11.0 / 12.0) < 1e-9
+    assert res.info["unresolved_states"] == [((0, -4), (1, -1), (2, 5))]
     assert [tuple(a) for a in res.sequence] == [(0, -4), (1, 0), (2, 4)]
     assert res.nodes_expanded == 254
     assert res.nodes_generated == 1085
     assert res.qp_solves == 2002
     assert res.closed_size == 254
-    assert res.host_verifications == 5
+    assert res.host_verifications == 6
     assert res.host_verified
 
 
@@ -268,14 +291,20 @@ def test_bnb_robust_disabled_matches_static_baseline():
     res = bnb.certify(
         3, 1.0 / 12.0, TOL, opts=SolverOptions(), progress=False, robust=False
     )
-    assert res.certified and res.stop_reason == "optimal"
+    # Sound tri-state semantics: the harmonic boundary state at 11/12 is
+    # undecidable at tolerance, so n=3 reports the interval [5/6, 11/12]
+    # with one unresolved state rather than a point optimum.
+    assert not res.certified and res.stop_reason == "unresolved"
     assert abs(res.optimum - 5.0 / 6.0) < 1e-9
+    assert abs(res.lower - 5.0 / 6.0) < 1e-9
+    assert abs(res.upper - 11.0 / 12.0) < 1e-9
+    assert res.info["unresolved_states"] == [((0, -4), (1, -1), (2, 5))]
     assert [tuple(a) for a in res.sequence] == [(0, -4), (1, 0), (2, 4)]
     assert res.nodes_expanded == 254
     assert res.nodes_generated == 1085
     assert res.qp_solves == 2002
     assert res.closed_size == 254
-    assert res.host_verifications == 5
+    assert res.host_verifications == 6
     assert res.info["robust"] is False
 
 

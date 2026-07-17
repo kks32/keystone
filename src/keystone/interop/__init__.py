@@ -19,6 +19,7 @@ from .franka_scene import (
     dls_ik,
     prop_cert_boxes,
     reset_home,
+    resolve_panda_xml,
     staging_world,
     target_world,
 )
@@ -46,6 +47,7 @@ __all__ = [
     "orientation_error",
     "prop_cert_boxes",
     "reset_home",
+    "resolve_panda_xml",
     "restacked_cubes",
     "settle_test",
     "split_reacher",

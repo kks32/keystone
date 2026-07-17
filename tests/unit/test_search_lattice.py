@@ -762,3 +762,60 @@ class TestBallastDirection:
         # The light ballast cannot hold the reacher; the heavy ballast can.
         assert not feasibles[0]
         assert feasibles[-1]
+
+
+# =========================================================================
+# Spec validation and the bitwise default regression (fix 4).
+# =========================================================================
+
+
+class TestSpecValidation:
+    def test_ped_mass_matches_module_constants_bitwise(self):
+        # ped_mass now derives from the pedestal bounds on the spec. The
+        # default bounds reproduce the old module-constant product bit for bit.
+        spec = LT.LatticeSpec(n_max=3, dx=1.0 / 12.0)
+        assert spec.ped_mass == LT.DENSITY * LT.PEDESTAL_W * LT.PEDESTAL_H
+        assert spec.cube_mass == LT.DENSITY * 1.0 * 1.0
+
+    def test_default_build_system_weight_matches_constants_bitwise(self):
+        # The total weight of a default-spec state built through build_system is
+        # bit-identical to the constant-based hand value, so the bounds-derived
+        # ped_mass path did not move the default scene.
+        from keystone.mechanics.loads import DEFAULT_G
+
+        spec = LT.LatticeSpec(n_max=3, dx=1.0 / 12.0)
+        state = LT.state_from_placements(spec, [(0, -4)])
+        _A, _w, _G, _L, W = LT.build_system(spec, state)
+        expected = (
+            LT.DENSITY * LT.PEDESTAL_W * LT.PEDESTAL_H + LT.DENSITY
+        ) * DEFAULT_G
+        assert float(W) == expected
+
+    def test_invalid_scalars_raise(self):
+        with pytest.raises(ValueError, match="n_max"):
+            LT.LatticeSpec(n_max=0, dx=DX)
+        with pytest.raises(ValueError, match="n_max"):
+            LT.LatticeSpec(n_max=-2, dx=DX)
+        with pytest.raises(ValueError, match="dx"):
+            LT.LatticeSpec(n_max=3, dx=0.0)
+        with pytest.raises(ValueError, match="dx"):
+            LT.LatticeSpec(n_max=3, dx=-1.0)
+        with pytest.raises(ValueError, match="dx"):
+            LT.LatticeSpec(n_max=3, dx=float("inf"))
+        with pytest.raises(ValueError, match="x_lo < x_hi"):
+            LT.LatticeSpec(n_max=3, dx=DX, x_lo=4.0, x_hi=-3.0)
+        with pytest.raises(ValueError, match="mu"):
+            LT.LatticeSpec(n_max=3, dx=DX, mu=-0.1)
+        with pytest.raises(ValueError, match="density"):
+            LT.LatticeSpec(n_max=3, dx=DX, density=0.0)
+        with pytest.raises(ValueError, match="density"):
+            LT.LatticeSpec(n_max=3, dx=DX, density=-2000.0)
+        with pytest.raises(ValueError, match="g"):
+            LT.LatticeSpec(n_max=3, dx=DX, g=0.0)
+        with pytest.raises(ValueError, match="ped_left < ped_right"):
+            LT.LatticeSpec(n_max=3, dx=DX, ped_left=1.0, ped_right=-1.0)
+
+    def test_mu_zero_is_allowed(self):
+        # mu >= 0, so a frictionless lattice is a valid spec.
+        spec = LT.LatticeSpec(n_max=3, dx=DX, mu=0.0)
+        assert spec.mu == 0.0

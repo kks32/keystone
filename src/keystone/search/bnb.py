@@ -97,19 +97,38 @@ Reachability only removes actions, so every completion under a mode is
 also a static completion and the admissible bound below is unchanged: it
 never undercounts what a restricted mode can reach.
 
-Certification.
+Certification and the three-state screen.
 
-Expansion feasibility uses the certified qpax path (the lattice
-margins_of_states kernel) at the library default iteration cap
-(SolverOptions max_iter = 100), not the reduced search screen. Feasibility
-is margin <= tol.tol_feas and the cone-admissible/finite certified flag,
-the same rule the rest of the library uses. This is the reference verdict
-for infeasibility pruning. The reported optimum's build order is then
-re-verified prefix by prefix through the host pipeline (build_assembly +
-assemble + solve_p0), so the incumbent that pruning trusts is always a
-host-certified structure. When a node budget or a time limit is reached
-before the frontier proves optimality, the run reports the certified
-interval [incumbent, best remaining bound] and never claims optimality.
+A fast solve can fail to converge, so its verdict alone cannot justify a
+discard. Every candidate child is screened three ways by the qpax kernel at
+the library default iteration cap (SolverOptions max_iter = 100):
+
+- verified-feasible: margin <= tol.tol_eq and the cone-admissible/finite
+  flag both hold. This is a genuine feasible witness, the same rule the rest
+  of the library uses.
+- candidate-infeasible: the margin is finite and exceeds tol.tol_feas.
+- unknown: the margin is non-finite, or finite but not cone-admissible.
+
+A child is permanently discarded only after a verified infeasibility. A
+child whose admissible bound is already at or below the incumbent is dropped
+on the bound alone, which is sound. Every candidate-infeasible or unknown
+child whose bound still beats the incumbent escalates to the exact LP path
+(solve_p0_exact with its validated Farkas construction, cached per set). The
+exact verdict decides: infeasible discards the child, feasible keeps it, and
+an abstain (no convergence on either path) leaves the child live. A live
+child is expanded like any other; if it is a full stack that cannot be
+expanded, it is recorded as unresolved.
+
+The reported optimum's build order is re-verified prefix by prefix through
+the host pipeline (build_assembly + assemble + solve_p0), so the incumbent
+is always a host-verified structure.
+
+Claim. The run reports "proved optimal" only when the frontier is exhausted
+with every discard justified by bound-domination or a verified
+infeasibility, and no unresolved state has an overhang above the incumbent.
+Otherwise it reports the interval [incumbent, best remaining bound] with a
+count of unresolved states, and never claims optimality. A node or time
+budget that stops the run early yields the same interval.
 
 Determinism. One fixed candidate ordering, sorted (layer, index) actions,
 and a monotone push counter break every tie, so a run is reproducible.
@@ -117,15 +136,29 @@ and a monotone push counter break every tie, so a run is reproducible.
 
 import heapq
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from fractions import Fraction
 
 import numpy as np
 
 from ..geometry import Tolerances, box_2d, build_assembly
 from ..mechanics import assemble
-from ..solve import FEASIBLE, SolverOptions, solve_p0
+from ..solve import (
+    FEASIBLE,
+    INFEASIBLE,
+    NO_CONVERGE,
+    SolverOptions,
+    solve_p0,
+    solve_p0_exact,
+)
 from . import lattice as LT
+
+# Three-state screening classes for a candidate child. VERIFIED and
+# CAND_INFEASIBLE and UNKNOWN partition every screened set; only VERIFIED is a
+# feasible witness, only a verified infeasibility (exact path) may discard.
+VERIFIED = "feasible"
+CAND_INFEASIBLE = "candidate_infeasible"
+UNKNOWN = "unknown"
 
 # Frontier padding for the batched certified solve, matching mcts. Uncached
 # children are solved in power-of-two chunks capped at CHUNK so the compiled
@@ -163,16 +196,38 @@ def bound_of(key, n: int, dx: float, x_hi: float) -> float:
     return min(raw, x_hi + 0.5)
 
 
+def _classify_screen(margin, cert, tol):
+    """Three-state class of a screened set from its margin and cert flag.
+
+    cert is the kernel's cone-admissible-and-finite flag. VERIFIED needs a
+    finite margin at or below tol_eq with cert set, a feasible witness.
+    CAND_INFEASIBLE needs a finite margin above tol_feas. Everything else (a
+    non-finite margin, or a finite margin at or below tol_feas that is not
+    cone-admissible) is UNKNOWN: unverifiable in either direction.
+    """
+    finite = bool(np.isfinite(margin))
+    if finite and margin <= tol.tol_eq and cert:
+        return VERIFIED
+    if finite and margin > tol.tol_feas:
+        return CAND_INFEASIBLE
+    return UNKNOWN
+
+
 @dataclass
 class CertifyResult:
     """Outcome of a certification run.
 
     certified True means best-first branch and bound closed the gap and the
-    optimum is proven. False means a budget stopped the run and only the
-    interval [lower, upper] is certified. optimum is the incumbent overhang
-    (the best host-certified structure found); it equals lower. placement
-    records the reachability mode the run enforced ("static", "drop", or
-    "slide"); the optimum is proven within that mode's legal orders.
+    optimum is proven: the frontier was exhausted with every discard justified
+    by bound-domination or a verified infeasibility, and no unresolved state
+    outranks the incumbent. False means a budget stopped the run, or a state
+    could not be resolved, and only the interval [lower, upper] holds. optimum
+    is the incumbent overhang (the best host-verified structure found); it
+    equals lower. placement records the reachability mode the run enforced
+    ("static", "drop", or "slide"); the optimum is proven within that mode's
+    legal orders. exact_escalations counts sets sent to the exact LP path.
+    unresolved counts states the run could not decide whose overhang still
+    outranks the incumbent (each one blocks the optimality claim).
     """
 
     n: int
@@ -192,6 +247,8 @@ class CertifyResult:
     max_frontier: int
     qp_solves: int
     host_verifications: int
+    exact_escalations: int
+    unresolved: int
     closed_size: int
     wall_time: float
     info: dict = field(default_factory=dict)
@@ -267,8 +324,17 @@ class Certifier:
         # a feasibility tolerance.
         self.prune_eps = 0.5 * self.dx
 
-        # Feasibility of a set, cached by canonical key.
+        # Screen class of a set, cached by canonical key: one of VERIFIED,
+        # CAND_INFEASIBLE, UNKNOWN.
         self.feas_cache = {}
+        # Exact-LP verdict of a set, cached by canonical key: one of FEASIBLE,
+        # INFEASIBLE, NO_CONVERGE. Only sets that screen non-feasible and beat
+        # the incumbent reach it.
+        self.exact_cache = {}
+        # Sets that neither the screen nor the exact path could decide, mapped
+        # to their own overhang. A state here with overhang above the final
+        # incumbent blocks the optimality claim.
+        self.unresolved = {}
 
         self.incumbent = float("-inf")
         self.incumbent_seq = []
@@ -280,14 +346,20 @@ class Certifier:
         self.max_frontier = 0
         self.qp_solves = 0
         self.host_verifications = 0
+        self.exact_escalations = 0
 
     # --- feasibility oracle ----------------------------------------------
 
     def _solve_feasibility(self, keys):
-        """Certified qpax feasibility for a list of set keys, batched.
+        """Three-state qpax screen for a list of set keys, batched.
 
-        Fills feas_cache. Only uncached keys hit the solver. Uses the full
-        library iteration cap so the verdict is the reference, not a screen.
+        Fills feas_cache with one of VERIFIED, CAND_INFEASIBLE, UNKNOWN per
+        key. Only uncached keys hit the solver. Uses the full library
+        iteration cap so the screen is the reference, not a reduced search
+        screen. A non-finite margin, or a finite margin that is not
+        cone-admissible, is UNKNOWN (unverifiable either way); a finite
+        cone-admissible margin at or below tol_eq is VERIFIED; a finite margin
+        above tol_feas is CAND_INFEASIBLE.
         """
         pending = [k for k in keys if k not in self.feas_cache]
         seen = set()
@@ -324,9 +396,57 @@ class Certifier:
             margins = np.asarray(margins)
             cert = np.asarray(cert)
             for k, mg, cf in zip(chunk, margins[:c], cert[:c]):
-                feasible = (float(mg) <= self.tol.tol_feas) and bool(cf)
-                self.feas_cache[k] = feasible
+                self.feas_cache[k] = _classify_screen(
+                    float(mg), bool(cf), self.tol
+                )
             i += CHUNK
+
+    # --- exact-LP escalation ---------------------------------------------
+
+    def _exact_verdict(self, key):
+        """Exact-LP verdict for a set, cached. FEASIBLE/INFEASIBLE/NO_CONVERGE.
+
+        The escalation path for the three-state screen: a candidate-infeasible
+        or unknown set is decided here on the validated exact LP oracle before
+        it can be discarded, so an unconverged fast solve never deletes a live
+        branch. In robust mode the verdict is lam-robust: robust-feasible
+        means feasible at both +lam_min and -lam_min, so the verdict is
+        FEASIBLE only when both loaded states are exact-feasible, INFEASIBLE
+        when either is exact-infeasible, and NO_CONVERGE otherwise.
+        """
+        cached = self.exact_cache.get(key)
+        if cached is not None:
+            return cached
+        self.exact_escalations += 1
+        placed = list(key)  # key is already sorted
+        if self._homogeneous:
+            boxes = [box_2d(6.0, 1.0, -3.0, 0.5)]
+            for (L, j) in placed:
+                boxes.append(box_2d(1.0, 1.0, j * self.dx, 1.5 + L))
+            asm = build_assembly(boxes, mu=self.mu, tol=self.tol, dim=2)
+        else:
+            asm = self._host_assembly(placed)
+        system = assemble(asm, self.tol, cone="linear2d")
+        if not self.robust:
+            status = solve_p0_exact(system, self.tol).status
+        else:
+            w_live = system.w_live
+            sp = solve_p0_exact(
+                replace(system, w_dead=system.w_dead + self.lam_min * w_live),
+                self.tol,
+            ).status
+            sm = solve_p0_exact(
+                replace(system, w_dead=system.w_dead - self.lam_min * w_live),
+                self.tol,
+            ).status
+            if sp == INFEASIBLE or sm == INFEASIBLE:
+                status = INFEASIBLE
+            elif sp == FEASIBLE and sm == FEASIBLE:
+                status = FEASIBLE
+            else:
+                status = NO_CONVERGE
+        self.exact_cache[key] = status
+        return status
 
     # --- host re-verification --------------------------------------------
 
@@ -407,8 +527,15 @@ class Certifier:
         same admissible-bound prune applied one step earlier, and it removes
         the feasibility solve entirely for those children.
 
+        Screened children are then handled three ways. A verified-feasible
+        child is kept. A candidate-infeasible or unknown child that still beats
+        the incumbent escalates to the exact LP path: infeasible discards it,
+        feasible keeps it, and an abstain leaves it live and records it as
+        unresolved. Only a verified infeasibility (or bound-domination) ever
+        discards a child, so an unconverged fast solve cannot delete a branch.
+
         Returns a list of (child_key, child_seq, overhang, depth, bound) for
-        every feasible child, across all nodes.
+        every surviving child (feasible or live), across all nodes.
         """
         keys = [key for (key, _seq) in nodes]
         states = LT.batch_states(self.spec, keys)
@@ -435,36 +562,84 @@ class Certifier:
 
         out = []
         for (seq, cand) in per_node:
+            # Split the screen: genuine feasible witnesses versus the rest.
             feasible = []
+            pending = []
             for (a, ck, cb) in cand:
-                if self.feas_cache[ck]:
+                if self.feas_cache[ck] == VERIFIED:
                     child_seq = seq + [a]
                     ov = LT.overhang(ck, self.dx)
                     feasible.append((ck, child_seq, ov, len(ck), cb, a))
+                else:
+                    pending.append((a, ck, cb))
 
-            # Incumbent update. Verify improving children in descending
-            # overhang order and stop at the first host-certified one; the
-            # rest have lower overhang and cannot beat it.
-            for (ck, child_seq, ov, depth, cb, a) in sorted(
-                feasible, key=lambda t: (-t[2], t[5])
-            ):
-                if ov <= self.incumbent + self.prune_eps:
-                    break
-                ok, trace = self.host_prefix_feasible(child_seq)
-                self.host_verifications += 1
-                if ok:
-                    self.incumbent = ov
-                    self.incumbent_seq = list(child_seq)
-                    self.incumbent_trace = trace
-                    break
-                # Host disagrees with the fast oracle. Do not raise the
-                # incumbent; keep exploring lower-overhang siblings.
+            # Raise the incumbent on the fast-feasible pool first, so the
+            # escalation below sees the tightest incumbent and skips more
+            # bound-dominated children without an exact solve.
+            self._incumbent_update(feasible)
+
+            # Escalate the non-feasible children that still beat the incumbent.
+            # Drop the bound-dominated ones on the bound alone (sound). The
+            # exact path is the only thing that may permanently discard a
+            # child, via a verified infeasibility.
+            exact_feasible = []
+            live = []
+            for (a, ck, cb) in pending:
+                if cb <= self.incumbent + self.prune_eps:
+                    continue
+                ev = self._exact_verdict(ck)
+                if ev == INFEASIBLE:
+                    continue
+                child_seq = seq + [a]
+                ov = LT.overhang(ck, self.dx)
+                rec = (ck, child_seq, ov, len(ck), cb, a)
+                if ev == FEASIBLE:
+                    exact_feasible.append(rec)
+                else:
+                    # Neither path decided. Keep the child live and record it;
+                    # a live full stack whose overhang beats the incumbent
+                    # blocks the optimality claim.
+                    self.unresolved[ck] = ov
+                    live.append(rec)
+
+            # Exact-feasible children can also raise the incumbent.
+            self._incumbent_update(exact_feasible)
 
             out.extend(
                 (ck, child_seq, ov, depth, cb)
-                for (ck, child_seq, ov, depth, cb, a) in feasible
+                for (ck, child_seq, ov, depth, cb, a)
+                in feasible + exact_feasible + live
             )
         return out
+
+    def _incumbent_update(self, feasible):
+        """Raise the incumbent on the first host-verified feasible child.
+
+        Verify improving children in descending overhang order and stop at the
+        first the host pipeline confirms; the rest have lower overhang and
+        cannot beat it. Every child here is a feasible set (a fast screen
+        witness or an exact-LP witness), so it is a valid answer. When the host
+        pipeline cannot confirm its build order, we can neither promote it to
+        the incumbent nor rule it out, so it is recorded as unresolved and
+        blocks the optimality claim. The incumbent stays the best structure the
+        host pipeline itself verifies.
+        """
+        for (ck, child_seq, ov, depth, cb, a) in sorted(
+            feasible, key=lambda t: (-t[2], t[5])
+        ):
+            if ov <= self.incumbent + self.prune_eps:
+                break
+            ok, trace = self.host_prefix_feasible(child_seq)
+            self.host_verifications += 1
+            if ok:
+                self.incumbent = ov
+                self.incumbent_seq = list(child_seq)
+                self.incumbent_trace = trace
+                break
+            # Feasible set, but the host pipeline could not confirm the build
+            # order. Record it: if its overhang outranks the final incumbent it
+            # degrades the claim to an interval.
+            self.unresolved[ck] = ov
 
     # --- driver -----------------------------------------------------------
 
@@ -571,6 +746,24 @@ class Certifier:
             else:
                 certified = False
 
+        # Unresolved states block the optimality claim. A state the run could
+        # not decide, whose own overhang still beats the incumbent, might be a
+        # feasible structure better than the incumbent, and nothing ruled it
+        # out. Its bound is a valid contribution to the interval upper.
+        blocking = {
+            k: ov for k, ov in self.unresolved.items()
+            if ov > self.incumbent + self.prune_eps
+        }
+        if blocking:
+            certified = False
+            upper = max(
+                [upper]
+                + [bound_of(k, self.n, self.dx, self.x_hi) for k in blocking]
+            )
+            if stop_reason == "optimal":
+                stop_reason = "unresolved"
+        n_unresolved = len(blocking)
+
         # Host re-verify the reported optimum's build order one more time so
         # the emitted record stands on the certified pipeline alone. Under a
         # reachability mode, also re-check the build order step by step; the
@@ -603,12 +796,15 @@ class Certifier:
             max_frontier=self.max_frontier,
             qp_solves=self.qp_solves,
             host_verifications=self.host_verifications,
+            exact_escalations=self.exact_escalations,
+            unresolved=int(n_unresolved),
             closed_size=len(closed),
             wall_time=wall,
             info={
                 "reach_verified": bool(reach_verified),
                 "robust": self.robust,
                 "lam_min": self.lam_min if self.robust else None,
+                "unresolved_states": sorted(blocking),
             },
         )
 

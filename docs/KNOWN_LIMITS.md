@@ -155,28 +155,38 @@ applied wrenches, arbitrary directions) need `dataclasses.replace` on the
 Not reachable in the cube slice (box faces clip to convex polygons). The v1 policy
 for the mesh pipeline remains: drop polygons with holes and log a warning.
 
-## Heterogeneous lattice materials: sorted-cell assignment and min friction (2026-07-16)
+## Heterogeneous lattice materials: sorted-cell assignment and min friction (2026-07-16, updated 2026-07-17)
 
 `LatticeSpec` carries optional per-cube density (`densities`), per-cube friction
 (`mu_by_slot`), and a pedestal-ground friction (`mu_ground`), each one value per
 placement slot. Two modeling choices are recorded here.
 
-Material is assigned by sorted-cell position, not by build order. `build_system`
-sorts the active slots by (layer, index) to fix node ids and carries each cube's
-density and friction with it through that sort. The branch-and-bound certifier
-(`keystone.search.bnb`) builds every state from its canonical (sorted) placement
-set, so in a certified run the i-th cube in sorted (layer, index) order takes
-`densities[i]` and `mu_by_slot[i]`. This keeps the assembly of a set a function of
-the set alone, which the closed-list transposition argument needs: two build
-orders of the same set are the same assembly. The cost is that inventory order is
-pinned to the sorted-cell convention. A caller who wants a specific density on a
-specific cube sorts the inventory to place it; a caller who wants to compare
-consumption orders passes different `densities` tuples (the material sweep does
-this). The admissible bound is geometry only and never reads material, so it stays
-valid under any assignment. A cube's material can therefore appear to move between
-prefixes of one build order, because adding a lower-sorted cube shifts the sorted
-positions; this is consistent with how the fast oracle scores each prefix set and
-is re-verified prefix by prefix on the host pipeline.
+Material assignment is by sorted-cell position, and this is a modeling choice,
+not a fixed physical inventory of labeled blocks. `build_system` sorts the active
+slots by (layer, index) to fix node ids and gives the i-th cube in that sorted
+order `densities[i]` and `mu_by_slot[i]`. The array entry names a sorted slot,
+not a particular block: which physical cube receives `densities[i]` depends on
+which cells are occupied. Adding a lower-sorted cube shifts every higher cube
+down one slot, so a cube's assigned material re-ranks as the set grows. Within
+one build order the material of a placed cube can therefore appear to move from
+prefix to prefix. The reason for the choice is that it makes the assembly of a
+set a function of the set alone, which the branch-and-bound (`keystone.search.bnb`)
+closed-list transposition argument needs: two build orders of the same set are
+the same assembly. The admissible bound is geometry only and never reads
+material, so it stays valid under any assignment.
+
+Consequence for the density-mix optima. A material sweep that varies the
+`densities` tuple is sweeping the sorted-slot assignment, not a fixed set of
+labeled blocks carried through the structure. An optimum reported for a given
+tuple is the best overhang when heavy and light material land in that sorted
+order; the same physical cube can carry a different density at different depths
+of the same build. Read the density-mix optima as "the heavy material sits at
+this sorted slot", not as "this specific cube is heavy". A caller who wants a
+chosen density pinned to a chosen physical cube sorts the inventory to place it;
+a caller comparing consumption orders passes different `densities` tuples (the
+material sweep does this). A slot-bound variant that ties each material to a
+labeled block across all prefixes, independent of the sorted set, is future
+work.
 
 Patch friction combines by the minimum of the two block materials. A cube-cube
 patch takes `min(mu_i, mu_j)`; a pedestal-cube patch takes `min(mu_cube, mu)` with
@@ -188,6 +198,55 @@ geometric or elliptic combine of the two geom frictions), so a MuJoCo replay of
 the same scene need not agree with the min rule at a friction-limited contact. On
 this lattice cubes never touch the ground, so `mu_ground` only ever sets the
 pedestal-ground patch.
+
+## Lattice minimum overlap is 2 dx, so grid refinement changes the geometry too (2026-07-17)
+
+The lattice support rule requires a footprint overlap of at least 2 dx. In
+`is_legal` a layer-0 cube needs `ped_ov > 1.5 * dx` (which is >= 2 dx on the
+grid, where positions are multiples of dx) and a layer-L cube needs the same
+floor against its support below. The smallest overlap a legal contact may have
+is therefore 2 dx in absolute block-width units, tied directly to dx.
+
+Refining dx does two things at once. It makes the placement grid finer (more
+candidate positions per layer), and it shrinks the smallest admissible overlap:
+2 dx is 1/6 of a block width at dx = 1/12 and 1/12 of a block width at dx = 1/24.
+A grid-refinement comparison such as the static 5/4 optimum at dx = 1/12 against
+31/24 at dx = 1/24 mixes the two effects. Part of the change in the reported
+optimum is finer placement resolution and part is a looser (smaller) minimum
+overlap that admits thinner contacts. The two cannot be separated by changing dx
+alone, so a deeper overhang at a finer grid is not evidence that resolution
+alone helped; the admissible geometry moved with it. A clean study would hold
+the minimum overlap fixed in absolute units while refining dx, which the current
+2 dx rule does not allow. Future work.
+
+## MuJoCo contact pairs: "all" by default for collapse, "adjacent" for pre-collapse (2026-07-17)
+
+`to_mjcf` emits explicit contact pairs and takes a `pairs` mode. "all" (the new
+default) emits a pair for every block-block and block-ground combination, so a
+block that moves during collapse can contact any other block and the failure
+trajectory is correct. "adjacent" emits only the block-block pairs whose
+start-pose AABBs overlap (plus every block-ground pair); it is cheaper but a
+block that leaves its start neighborhood passes through non-neighbors with no
+contact. The old boolean `all_pairs` is kept as an alias (True maps to "all",
+False to "adjacent") and overrides `pairs` when set, so callers written against
+the flag keep their exact behavior.
+
+The default changed from adjacent to all on 2026-07-17. Under the old default a
+collapsing block passed through non-neighbors, which distorted settle and
+validate trajectories on assemblies of three or more blocks. Cost of the new
+default: the block-block pair count grows as N (N - 1) / 2, so a large assembly
+builds and steps more slowly under "all". Use "adjacent" only for tight-loop,
+pre-collapse checks where the contact set is fixed by the start pose. The settle,
+validate, insertion, and falsework paths use "all".
+
+Spot check, offset pair e = 0.55 settle (two unit blocks, upper offset 0.55 > b/2,
+mu 0.9, 1 s). The trajectory is bit-for-bit identical under "adjacent" and "all":
+same three pairs (two ground plus one block-block), same final pose (max
+difference 0.0), the top block toppling (final rotation 1.22 rad, displacement
+0.67 m) in both. The reason is that the two blocks are AABB-adjacent at the start
+pose, so "adjacent" already emits the single block-block pair. The modes diverge
+only when a block can move outside its start-pose AABB neighborhood, which needs
+a third block; a two-block topple has nothing non-adjacent to reach.
 
 ## PDHG screening semantics (2026-07-15)
 

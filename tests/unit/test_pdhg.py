@@ -398,12 +398,17 @@ class TestValidationStudy:
 
 class TestSearchIntegration:
     def test_same_best_overhang_n4_sims500_seed0(self):
+        # tie_eps=0 pins the old deterministic tie-breaking so both searches
+        # explore in lockstep; the assertion is screener equivalence under
+        # identical exploration, not under stochastic exploration (where the
+        # screened admissibility can legitimately steer the tree elsewhere).
         tol = Tolerances()
-        s_qpax = Search(4, DX, tol, seed=0, search_iter=50, screener="qpax")
+        s_qpax = Search(4, DX, tol, seed=0, search_iter=50, screener="qpax",
+                        tie_eps=0.0)
         best_qpax = s_qpax.run(500)
         s_pdhg = Search(
             4, DX, tol, seed=0, search_iter=50, screener="pdhg",
-            pdhg_iters=DEFAULT_ITERS,
+            pdhg_iters=DEFAULT_ITERS, tie_eps=0.0,
         )
         best_pdhg = s_pdhg.run(500)
         print(
@@ -413,8 +418,12 @@ class TestSearchIntegration:
         )
         assert best_pdhg == pytest.approx(best_qpax, abs=1e-12)
         assert s_pdhg.best_sequence() == s_qpax.best_sequence()
-        # Re-verification volume stays a small fraction of the screens.
-        assert s_pdhg.n_reverify < 0.15 * s_pdhg.n_qp
+        # Re-verification volume stays a small fraction of the screens. The
+        # bound was 0.15 when only global-best improvements were certified;
+        # per-block-count bests (best_by_count) are certified too now, which
+        # adds re-verifies early in the run while every count's best is
+        # still rising.
+        assert s_pdhg.n_reverify < 0.25 * s_pdhg.n_qp
 
     def test_best_update_gated_on_certified_verdict(self):
         # Every best_key the pdhg search reports has a certified-feasible

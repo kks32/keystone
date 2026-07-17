@@ -189,7 +189,8 @@ def to_mjcf(
     free: Iterable[int] | None = None,
     timestep: float = 5e-4,
     aabb_gap: float = 1e-3,
-    all_pairs: bool = False,
+    pairs: str = "all",
+    all_pairs: bool | None = None,
     solref: tuple[float, float] | None = None,
     solimp: tuple[float, ...] | None = None,
     condim: int = 3,
@@ -207,9 +208,22 @@ def to_mjcf(
           listed become static (welded to the world, no joint).
     timestep: MuJoCo integrator step, seconds.
     aabb_gap: AABB inflation for adjacency detection, meters.
-    all_pairs: if True, emit a pair for every geom-geom combination (used by the
-          insertion demo where the moving block's contacts are not known from the
-          start pose). Default emits AABB-adjacent pairs only.
+    pairs: contact-pair mode.
+          "all" (default) emits a pair for every block-block and block-ground
+          combination. A collapsing block can then contact any other block, so
+          failure trajectories are correct. This is the safe default for
+          collapse studies, settle tests, and insertion. Cost: the pair count
+          grows as N^2 / 2, so a large assembly builds and steps more slowly
+          than under "adjacent".
+          "adjacent" emits only AABB-adjacent block-block pairs (plus every
+          block-ground pair). Cheaper, but a block that moves far from its start
+          pose passes through non-neighbors. Use it only for tight-loop cases
+          that stay pre-collapse, where the contact set is fixed by the start
+          pose.
+    all_pairs: deprecated boolean alias for pairs. None (default) defers to
+          pairs. True maps to pairs="all", False to pairs="adjacent". When set
+          it overrides pairs, so callers written against the old flag keep their
+          exact behavior.
     solref, solimp: contact stiffness overrides. None keeps MuJoCo defaults.
     condim: contact dimensionality, 3 = sliding friction only.
     extra_worldbody, extra_equality: raw XML appended inside <worldbody> and
@@ -223,6 +237,11 @@ def to_mjcf(
     n = len(boxes)
     if n == 0:
         raise ValueError("to_mjcf needs at least one box")
+    # Resolve the contact-pair mode. The old boolean overrides pairs when set.
+    if all_pairs is not None:
+        pairs = "all" if all_pairs else "adjacent"
+    if pairs not in ("all", "adjacent"):
+        raise ValueError(f"pairs must be 'all' or 'adjacent', got {pairs!r}")
     if free is None:
         free_set = set(range(n))
     else:
@@ -287,7 +306,7 @@ def to_mjcf(
             f'    <pair geom1="{_GROUND}" geom2="geom{i}" '
             f'condim="{condim}" friction="{fric}"{solref_attr}{solimp_attr}/>'
         )
-    if all_pairs:
+    if pairs == "all":
         bb = [(i, j) for i in range(n) for j in range(i + 1, n)]
     else:
         bb = aabb_adjacent_pairs(boxes, aabb_gap)
@@ -326,7 +345,12 @@ def from_mjcf(xml_or_model) -> list[Box]:
     Plane geoms (the ground, node 0) are skipped. Any other non-box geom raises
     a ValueError. Box world pose comes from the forward-kinematics geom frame,
     so the round trip to_mjcf -> from_mjcf reproduces poses to machine precision.
-    Density is recovered as body mass over box volume (one geom per body).
+    Density is body mass distributed over the body's geoms by volume share:
+    each geom takes density = body_mass / (total box volume of the body). A
+    single-geom body recovers its density exactly; a multi-geom body of one
+    density recovers that density on every geom, and total mass is conserved.
+    A body whose geoms differ in density recovers the body's average density on
+    each (the true per-geom densities are not stored in MjModel).
     """
     import mujoco
 
@@ -346,6 +370,18 @@ def from_mjcf(xml_or_model) -> list[Box]:
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
 
+    # Total box volume per body, so a body's mass distributes over its geoms by
+    # volume share. This gives each geom the body's density and conserves the
+    # body mass; assigning the full body mass to every geom would overstate the
+    # density of a multi-geom body.
+    body_box_volume: dict[int, float] = {}
+    for g in range(model.ngeom):
+        if int(model.geom_type[g]) != int(mujoco.mjtGeom.mjGEOM_BOX):
+            continue
+        bid = int(model.geom_bodyid[g])
+        vol = 8.0 * float(np.prod(np.asarray(model.geom_size[g], dtype=np.float64)))
+        body_box_volume[bid] = body_box_volume.get(bid, 0.0) + vol
+
     boxes: list[Box] = []
     for g in range(model.ngeom):
         gtype = int(model.geom_type[g])
@@ -361,8 +397,7 @@ def from_mjcf(xml_or_model) -> list[Box]:
         pos = np.asarray(data.geom_xpos[g], dtype=np.float64).copy()
         quat = _mat_to_quat(data.geom_xmat[g])
         bid = int(model.geom_bodyid[g])
-        volume = 8.0 * float(np.prod(half))
-        density = float(model.body_mass[bid]) / volume
+        density = float(model.body_mass[bid]) / body_box_volume[bid]
         boxes.append(Box(half, pos, quat, density))
     return boxes
 

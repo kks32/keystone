@@ -27,9 +27,24 @@ the best overhang is first re-verified with the certified qpax kernel
 the best-overhang tracking. The final host-pipeline re-verification of the
 best sequence is unchanged. See docs/KNOWN_LIMITS.md, screening semantics.
 
-Determinism: one numpy Generator seeds the run, iteration order is fixed,
-and PUCT ties break by the first action in the sorted action list, so the
-same seed gives the same best overhang and sequence every time.
+Stochasticity and determinism: one numpy Generator seeds the run and now
+actually drives exploration. PUCT ties break by a seeded epsilon jitter
+(tie_eps, relative to the O(1) score scale) instead of always by the first
+sorted action, so two different seeds explore genuinely different trees while
+one seed reproduces its own run bit for bit. Optional root Dirichlet noise
+(root_noise, the AlphaZero root prior perturbation) and optional
+temperature action sampling (sample_action) also draw from the same
+Generator. All three default off nowhere they matter for reproducibility:
+tie_eps is on so seeds diverge, root_noise defaults off (self-play data
+collection turns it on, pure evaluation leaves it off), and temperature
+defaults to argmax.
+
+Best-overhang tracking is reported two ways. best_overhang is the best over
+every certified-feasible state the search visits at any depth (best-at-most-n).
+best_by_count[c] is the best over states using exactly c cubes, so a size-n
+run can report its exact-n design separately from a shorter design that
+happens to reach further. The two differ whenever the deepest feasible design
+is not the widest one.
 """
 
 import math
@@ -66,6 +81,11 @@ class Search:
         prior_fn=None,
         value_fn=None,
         lam_min=None,
+        tie_eps=1e-9,
+        root_noise=False,
+        dirichlet_alpha=0.3,
+        dirichlet_frac=0.25,
+        temperature=0.0,
     ):
         self.n = n
         self.dx = dx
@@ -73,6 +93,25 @@ class Search:
         self.c_puct = c_puct
         self.K = int(batch)
         self.rng = np.random.default_rng(seed)
+        # Real stochasticity, all off the same seeded Generator so a seed
+        # reproduces its run and distinct seeds genuinely diverge.
+        # tie_eps: uniform jitter added to each PUCT score, on the O(1) score
+        #   scale (default 1e-9), so exact ties break randomly per seed instead
+        #   of always by the first sorted action. It never overrides a real
+        #   score gap. Set 0.0 to recover first-action tie-breaking.
+        # root_noise: mix Dirichlet(dirichlet_alpha) noise into the root prior
+        #   at weight dirichlet_frac. Default off; self-play data collection
+        #   turns it on, pure evaluation leaves it off.
+        # temperature: softmax temperature for sample_action over visit counts.
+        #   Default 0.0 is argmax (eval). Positive values sample self-play moves.
+        self.tie_eps = float(tie_eps)
+        self.root_noise = bool(root_noise)
+        self.dirichlet_alpha = float(dirichlet_alpha)
+        self.dirichlet_frac = float(dirichlet_frac)
+        self.temperature = float(temperature)
+        # Root Dirichlet draw over the root's admissible actions, filled once
+        # when the root expands (only when root_noise is on).
+        self._root_noise = None
         # Optional learned-search hooks. prior_fn(state_key, action_indices)
         # returns a prior probability vector over those actions, replacing the
         # uniform PUCT prior. value_fn(state_key) returns a scalar in [0, 1]
@@ -137,6 +176,19 @@ class Search:
         self.best_key = None
         self.best_parent = None
         self.best_action = None
+        # Per-block-count bests, so exact-n and best-at-most-n are reported
+        # separately. best_by_count[c] = (overhang, key, parent_key, action)
+        # for the best certified-feasible state that uses exactly c cubes.
+        self.best_by_count = {}
+
+        # Full DAG child edges recorded at expansion. A state (canonical key)
+        # can be reached from several parents in the transposition table; the
+        # single node["parent"] field keeps only the first. Every expanded node
+        # enumerates its complete legal-child frontier, so recording those
+        # edges here captures every parent->child relation. Subtree-value
+        # targets (az._subtree_targets) aggregate over these, not one parent.
+        self._children_of = {}
+        self._parents_of = {}
 
         # Instrumentation.
         self.t_legal = 0.0  # legality passes, seconds
@@ -401,6 +453,9 @@ class Search:
                 # First-seen parent, for pdhg warm starts. Transpositions can
                 # give several parents; any screened parent is a valid start.
                 self._parent_of.setdefault(ck, node["key"])
+                # Full DAG edge, for DAG-correct subtree-value targets.
+                self._children_of.setdefault(node["key"], set()).add(ck)
+                self._parents_of.setdefault(ck, set()).add(node["key"])
 
         self._solve_frontier(all_children)
 
@@ -415,10 +470,11 @@ class Search:
             for node, actions in zip(pending, per_leaf_actions):
                 for a in actions:
                     ck = self._child_key(node["key"], a)
-                    if (
-                        LT.overhang(ck, self.dx) > self.best_overhang
-                        and ck not in self._cert_cache
-                    ):
+                    if ck in self._cert_cache:
+                        continue
+                    ov = LT.overhang(ck, self.dx)
+                    prev = self.best_by_count.get(len(ck))
+                    if ov > self.best_overhang or prev is None or ov > prev[0]:
                         improving.append(ck)
             self._certify_batch(improving)
 
@@ -432,21 +488,40 @@ class Search:
                     admissible.append(a)
                     node["N_a"][a] = 0
                     node["W_a"][a] = 0.0
+                count = len(ck)
                 ov = LT.overhang(ck, self.dx)
-                if ov > self.best_overhang:
+                prev_count = self.best_by_count.get(count)
+                improves_count = prev_count is None or ov > prev_count[0]
+                improves_global = ov > self.best_overhang
+                if improves_count or improves_global:
                     # The best update is gated on the certified verdict when
                     # screening, on the (already certified) qpax verdict
-                    # otherwise.
+                    # otherwise. One certification serves both the global and
+                    # the per-count update.
                     if self.screener == "pdhg":
                         best_ok = self._certified_feasible(ck)
                     else:
                         best_ok = feasible
                     if best_ok:
-                        self.best_overhang = ov
-                        self.best_key = ck
-                        self.best_parent = node["key"]
-                        self.best_action = a
+                        if improves_count:
+                            self.best_by_count[count] = (ov, ck, node["key"], a)
+                        if improves_global:
+                            self.best_overhang = ov
+                            self.best_key = ck
+                            self.best_parent = node["key"]
+                            self.best_action = a
             node["actions"] = admissible
+            # Root Dirichlet noise, sampled once when the root's admissible set
+            # is known. Drawn from the seeded Generator so it is reproducible
+            # per seed and different across seeds.
+            if (self.root_noise and node is self.root and admissible
+                    and self._root_noise is None):
+                draw = self.rng.dirichlet(
+                    np.full(len(admissible), self.dirichlet_alpha)
+                )
+                self._root_noise = {
+                    a: float(x) for a, x in zip(admissible, draw)
+                }
             # Learned priors over the admissible actions. Computed once at
             # expansion and frozen, as in AlphaZero. When prior_fn is None the
             # dict stays empty and _puct_action falls back to the uniform prior.
@@ -469,12 +544,16 @@ class Search:
         """Argmax of Q + c_puct P sqrt(N) / (1 + N_a), uniform prior.
 
         Skips children whose subtree is solved. Returns None when every child
-        is solved (this node is then solved too). Ties break by the first
-        action in the sorted list.
+        is solved (this node is then solved too). Ties break by a seeded
+        epsilon jitter (tie_eps), so distinct seeds explore different trees;
+        the jitter is on the O(1) score scale and never overrides a real gap.
+        When root_noise is on, the root prior is mixed with Dirichlet noise.
         """
         actions = node["actions"]
         prior = 1.0 / len(actions)
         sqrt_n = math.sqrt(node["N"]) if node["N"] > 0 else 0.0
+        noise = self._root_noise if node is self.root else None
+        frac = self.dirichlet_frac
         best_a = None
         best_score = float("-inf")
         for a in actions:
@@ -485,8 +564,12 @@ class Search:
             q = node["W_a"][a] / na if na > 0 else 0.0
             # Uniform prior by default; the learned prior when prior_fn is set.
             p = prior if self.prior_fn is None else node["P_a"][a]
+            if noise is not None:
+                p = (1.0 - frac) * p + frac * noise.get(a, 0.0)
             u = self.c_puct * p * sqrt_n / (1.0 + na)
             score = q + u
+            if self.tie_eps > 0.0:
+                score += self.tie_eps * self.rng.random()
             if score > best_score:
                 best_score = score
                 best_a = a
@@ -638,7 +721,11 @@ class Search:
         return list(reversed(seq))
 
     def best_sequence(self):
-        """Action sequence (list of (L, j)) that builds the best state."""
+        """Action sequence (list of (L, j)) that builds the best state.
+
+        This is the best-at-most-n state (best_overhang), which may use fewer
+        than n cubes. For the exact-n design use exact_sequence(self.n).
+        """
         if self.best_key is None:
             return []
         if self.best_parent is not None:
@@ -646,6 +733,49 @@ class Search:
         if self.best_key in self.tree:
             return self.history_of(self.best_key)
         return sorted(self.best_key, key=lambda lj: (lj[0], lj[1]))
+
+    def exact_overhang(self, count):
+        """Best certified-feasible overhang over states using exactly `count`
+        cubes, or -inf if none was found. best_overhang is the max over all
+        counts (best-at-most-n); this isolates one block count."""
+        rec = self.best_by_count.get(count)
+        return float("-inf") if rec is None else rec[0]
+
+    def exact_sequence(self, count):
+        """Build order (list of (L, j)) for the best exact-`count` state."""
+        rec = self.best_by_count.get(count)
+        if rec is None:
+            return []
+        _ov, key, parent, action = rec
+        if parent is not None:
+            return self.history_of(parent) + [action]
+        return sorted(key, key=lambda lj: (lj[0], lj[1]))
+
+    def sample_action(self, node, temperature=None):
+        """Pick a child action from visit counts with a softmax temperature.
+
+        temperature == 0 (default) is argmax over visit counts, the
+        deterministic eval move. temperature > 0 samples proportional to
+        N_a ** (1 / temperature) using the constructor Generator, the
+        AlphaZero self-play move rule. Returns None when the node has no
+        admissible action. This is the episodic move primitive; the
+        distillation pipeline supervises on the full visit distribution
+        (az.selfplay_samples) rather than sampled single moves.
+        """
+        if temperature is None:
+            temperature = self.temperature
+        actions = node["actions"]
+        if not actions:
+            return None
+        visits = np.array([node["N_a"].get(a, 0) for a in actions],
+                          dtype=np.float64)
+        if temperature <= 0.0 or visits.sum() <= 0.0:
+            return actions[int(np.argmax(visits))]
+        logits = np.log(np.maximum(visits, 1e-12)) / temperature
+        logits -= logits.max()
+        p = np.exp(logits)
+        p /= p.sum()
+        return actions[int(self.rng.choice(len(actions), p=p))]
 
     def tree_report(self):
         """Per-depth node and terminal counts with the best overhang seen."""

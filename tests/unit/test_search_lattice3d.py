@@ -567,3 +567,69 @@ class TestShapesAndKernel:
             solver_tol=SOLVER_TOL, max_iter=MAX_ITER,
         )
         assert np.max(np.abs(margins[idx] - np.asarray(m2))) < 1e-9
+
+
+# =========================================================================
+# Spec validation and the bitwise default regression (fix 4).
+# =========================================================================
+
+
+class TestSpecValidation:
+    def test_ped_mass_matches_module_constants_bitwise(self):
+        # ped_mass now derives from the pedestal bounds on the spec. The
+        # default bounds reproduce the old module-constant product bit for bit.
+        spec = L3.LatticeSpec3D(n_max=4, dx=DX)
+        assert spec.ped_mass == (
+            L3.DENSITY * L3.PEDESTAL_W * L3.PEDESTAL_D * L3.PEDESTAL_H
+        )
+        assert spec.cube_mass == L3.DENSITY * 1.0 * 1.0 * 1.0
+
+    def test_default_build_system_weight_matches_constants_bitwise(self):
+        # Total weight of a default-spec state through build_system is bitwise
+        # the constant-based hand value: the bounds-derived ped_mass path did
+        # not move the default scene.
+        from keystone.mechanics.loads import DEFAULT_G
+
+        spec = L3.LatticeSpec3D(n_max=4, dx=DX)
+        state = L3.state_from_placements(spec, [(0, -6, 0)])
+        _A, _w, _G, _L, W = L3.build_system(spec, state)
+        expected = (
+            L3.DENSITY * L3.PEDESTAL_W * L3.PEDESTAL_D * L3.PEDESTAL_H
+            + L3.DENSITY
+        ) * DEFAULT_G
+        assert float(W) == expected
+
+    def test_invalid_scalars_raise(self):
+        with pytest.raises(ValueError, match="n_max"):
+            L3.LatticeSpec3D(n_max=0, dx=DX)
+        with pytest.raises(ValueError, match="dx"):
+            L3.LatticeSpec3D(n_max=4, dx=0.0)
+        with pytest.raises(ValueError, match="dy"):
+            L3.LatticeSpec3D(n_max=4, dx=DX, dy=-1.0)
+        with pytest.raises(ValueError, match="dx"):
+            L3.LatticeSpec3D(n_max=4, dx=float("inf"))
+        with pytest.raises(ValueError, match="x_lo < x_hi"):
+            L3.LatticeSpec3D(n_max=4, dx=DX, x_lo=2.0, x_hi=-3.0)
+        with pytest.raises(ValueError, match="y_lo < y_hi"):
+            L3.LatticeSpec3D(n_max=4, dx=DX, y_lo=2.0, y_hi=-3.0)
+        with pytest.raises(ValueError, match="mu"):
+            L3.LatticeSpec3D(n_max=4, dx=DX, mu=-0.1)
+        with pytest.raises(ValueError, match="density"):
+            L3.LatticeSpec3D(n_max=4, dx=DX, density=0.0)
+        with pytest.raises(ValueError, match="g"):
+            L3.LatticeSpec3D(n_max=4, dx=DX, g=0.0)
+
+    def test_invalid_k_raises(self):
+        # k must be an even integer >= 4 (inscribed pyramid facet count).
+        with pytest.raises(ValueError, match="k"):
+            L3.LatticeSpec3D(n_max=4, dx=DX, k=3)  # odd
+        with pytest.raises(ValueError, match="k"):
+            L3.LatticeSpec3D(n_max=4, dx=DX, k=2)  # below 4
+        with pytest.raises(ValueError, match="k"):
+            L3.LatticeSpec3D(n_max=4, dx=DX, k=5)  # odd
+
+    def test_valid_k_accepted(self):
+        # Even k >= 4 is accepted; the default is 8.
+        assert L3.LatticeSpec3D(n_max=4, dx=DX, k=4).k == 4
+        assert L3.LatticeSpec3D(n_max=4, dx=DX, k=6).k == 6
+        assert L3.LatticeSpec3D(n_max=4, dx=DX).k == 8

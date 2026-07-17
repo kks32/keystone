@@ -7,20 +7,25 @@ name = "keystone"
 version = "0.0.1"
 description = "Rigid-block equilibrium for 2D and 3D box assemblies. Fast batched convex solvers in JAX; verify-or-abstain verdicts; load gradients today, pose and friction gradients planned."
 requires-python = ">=3.11"
+# Upper bounds cap the numerical stack at the .venv known-good versions
+# (jax/jaxlib 0.10.2, numpy 2.5.1, scipy 1.18.0, qpax 0.1.3, flax 0.12.7,
+# optax 0.2.8, mujoco 3.10.0). The next major or minor of these packages has
+# broken API in the past, so the ceilings guard reproducibility. README
+# install notes are maintained separately and are not edited from here.
 dependencies = [
-    "numpy>=1.26",
-    "scipy>=1.11",
-    "jax>=0.4.30",
-    "qpax>=0.1.3",
+    "numpy>=1.26,<3",
+    "scipy>=1.11,<2",
+    "jax>=0.4.30,<0.11",
+    "qpax>=0.1.3,<0.2",
 ]
 
 [project.optional-dependencies]
 viz = ["matplotlib>=3.8"]
 dev = ["pytest>=8", "hypothesis>=6", "matplotlib>=3.8"]
-cuda12 = ["jax[cuda12]>=0.4.30"]
-cuda13 = ["jax[cuda13]>=0.6"]
-learn = ["optax>=0.2", "flax>=0.9"]
-mujoco = ["mujoco>=3.2"]
+cuda12 = ["jax[cuda12]>=0.4.30,<0.11"]
+cuda13 = ["jax[cuda13]>=0.6,<0.11"]
+learn = ["optax>=0.2,<0.3", "flax>=0.9,<0.13"]
+mujoco = ["mujoco>=3.2,<4"]
 
 [project.license]
 file = "LICENSE"
