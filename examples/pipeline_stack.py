@@ -4,6 +4,7 @@ Run one stack size, or several with --batch, through search, certification,
 build planning, MuJoCo execution, and a movie.
 
     python examples/pipeline_stack.py --n 4 --sims 2000
+    python examples/pipeline_stack.py --n 4 --sims 2000 --executor franka
     python examples/pipeline_stack.py --batch 4,6 --sims 4000
     python examples/pipeline_stack.py --n 4 --sims 50 --no-video
 """
@@ -54,6 +55,13 @@ def main():
     )
     ap.add_argument("--out", type=str, default="out/pipeline", help="output dir")
     ap.add_argument(
+        "--executor",
+        type=str,
+        default="driver",
+        choices=["driver", "franka"],
+        help="EXECUTE stage: capped impedance driver (default) or Franka arm",
+    )
+    ap.add_argument(
         "--no-video", action="store_true", help="skip the movie (record=False)"
     )
     ap.add_argument(
@@ -80,6 +88,7 @@ def main():
             checkpoint=args.checkpoint,
             out_dir=args.out,
             record=not args.no_video,
+            executor=args.executor,
             progress=args.progress,
         )
         records.append(rec)

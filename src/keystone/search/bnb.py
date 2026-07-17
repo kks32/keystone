@@ -47,6 +47,12 @@ bound. A monotone admissible bound makes best-first branch and bound exact.
 The first time the frontier maximum bound drops to the incumbent, the
 incumbent is the true optimum.
 
+The bound is geometry only. It counts grid reach and never reads density
+or friction, so it stays admissible under heterogeneous materials: no
+feasible completion can exceed it whatever the cube masses or frictions.
+Materials only change which completions are feasible, which the QP verdict
+below decides, never the reach ceiling the bound enforces.
+
 All bounds and overhangs lie on the grid {k*dx + 0.5}, so any two differ by
 an integer multiple of dx. Pruning compares with a half-step margin 0.5*dx,
 which separates "no improvement possible" (difference <= 0) from "at least
@@ -65,6 +71,15 @@ repeat expansions of a set without losing any reachable completion.
 Reaching a set prefix-feasibly by one order does not make every order
 feasible, and the closed list never claims that: it only asserts that one
 feasible arrival is enough to enumerate the set's future.
+
+Heterogeneous materials keep this property. Each cube's density and
+friction is assigned by the sorted-cell position of the set, not by the
+order the set was built in, so the assembly of a set is still a function of
+the set alone. The i-th cube in sorted (layer, index) order takes
+densities[i] and mu_by_slot[i]. Inventory order is therefore fixed to that
+sorted-cell convention; a caller who wants a different assignment sorts the
+inventory before the run. The dedup and the transposition argument are
+unchanged.
 
 The argument survives the placement-reachability modes. A drop or slide
 check reads the set of already-placed cubes and the candidate cell, never
@@ -194,6 +209,9 @@ class Certifier:
         opts: SolverOptions = SolverOptions(),
         mu: float = LT.MU,
         placement: str = "static",
+        densities=None,
+        mu_ground=None,
+        mu_by_slot=None,
     ):
         self.n = int(n)
         self.dx = float(dx)
@@ -201,8 +219,31 @@ class Certifier:
         self.opts = opts
         self.mu = float(mu)
         self.placement = str(placement)
+        # Heterogeneous materials, one value per cube. densities and
+        # mu_by_slot are indexed by sorted-cell position of the set, because
+        # the search keys states on their canonical (sorted) placement set;
+        # see the module docstring on the admissible bound. None on all three
+        # is the homogeneous scene, evaluated exactly as before.
+        self.densities = None if densities is None else tuple(float(d) for d in densities)
+        self.mu_ground = None if mu_ground is None else float(mu_ground)
+        self.mu_by_slot = (
+            None if mu_by_slot is None else tuple(float(m) for m in mu_by_slot)
+        )
+        self._homogeneous = (
+            self.densities is None
+            and self.mu_by_slot is None
+            and self.mu_ground is None
+        )
 
-        self.spec = LT.LatticeSpec(n_max=self.n, dx=self.dx, mode=self.placement)
+        self.spec = LT.LatticeSpec(
+            n_max=self.n,
+            dx=self.dx,
+            mode=self.placement,
+            mu=self.mu,
+            densities=self.densities,
+            mu_ground=self.mu_ground,
+            mu_by_slot=self.mu_by_slot,
+        )
         self.x_hi = self.spec.x_hi
         cand_L, cand_J = LT.action_grid(self.spec)
         self.cand_L = cand_L
@@ -276,19 +317,58 @@ class Certifier:
         prefix, and stops at the first non-feasible prefix. Returns
         (all_feasible, trace) with trace a list of
         (layer, index, x, margin, status).
+
+        Heterogeneous runs assign each prefix its densities and frictions by
+        sorted-cell position, exactly how the fast oracle builds the set from
+        its canonical key, so the host verdict matches the oracle. The
+        homogeneous path is byte for byte the old code.
         """
-        boxes = [box_2d(6.0, 1.0, -3.0, 0.5)]
+        if self._homogeneous:
+            boxes = [box_2d(6.0, 1.0, -3.0, 0.5)]
+            trace = []
+            for (L, j) in seq:
+                x = j * self.dx
+                boxes.append(box_2d(1.0, 1.0, x, 1.5 + L))
+                asm = build_assembly(boxes, mu=self.mu, tol=self.tol, dim=2)
+                system = assemble(asm, self.tol, cone="linear2d")
+                r = solve_p0(system, self.tol)
+                trace.append((int(L), int(j), float(x), float(r.margin), r.status))
+                if r.status != FEASIBLE:
+                    return False, trace
+            return True, trace
+
         trace = []
+        placed = []
         for (L, j) in seq:
-            x = j * self.dx
-            boxes.append(box_2d(1.0, 1.0, x, 1.5 + L))
-            asm = build_assembly(boxes, mu=self.mu, tol=self.tol, dim=2)
+            placed.append((int(L), int(j)))
+            asm = self._host_assembly(placed)
             system = assemble(asm, self.tol, cone="linear2d")
             r = solve_p0(system, self.tol)
+            x = j * self.dx
             trace.append((int(L), int(j), float(x), float(r.margin), r.status))
             if r.status != FEASIBLE:
                 return False, trace
         return True, trace
+
+    def _host_assembly(self, placed):
+        """Host Assembly for a set of placed cells under heterogeneous materials.
+
+        placed is a list of (layer, index) cells. Sort by (layer, index) and
+        give the i-th sorted cube densities[i] and mu_by_slot[i], matching
+        build_system's per-slot read on a canonical key. The pedestal keeps
+        spec.density; friction combines by min via lattice.host_mu_fn.
+        """
+        order = sorted(range(len(placed)), key=lambda i: placed[i])
+        boxes = [box_2d(6.0, 1.0, -3.0, 0.5, density=self.spec.density)]
+        cube_materials = []
+        for si, oi in enumerate(order):
+            (L, j) = placed[oi]
+            dens = LT.DENSITY if self.densities is None else self.densities[si]
+            boxes.append(box_2d(1.0, 1.0, j * self.dx, 1.5 + L, density=dens))
+            mat = self.mu if self.mu_by_slot is None else self.mu_by_slot[si]
+            cube_materials.append(mat)
+        mu_fn = LT.host_mu_fn(self.mu, self.mu_ground, cube_materials)
+        return build_assembly(boxes, mu=self.mu, tol=self.tol, dim=2, mu_fn=mu_fn)
 
     # --- expansion --------------------------------------------------------
 
@@ -536,7 +616,27 @@ def certify(
     time_limit=None,
     progress=True,
     placement: str = "static",
+    mu: float = LT.MU,
+    densities=None,
+    mu_ground=None,
+    mu_by_slot=None,
 ) -> CertifyResult:
-    """Certify the grid optimum (or an interval) for n cubes at step dx."""
-    engine = Certifier(n, dx, tol, opts=opts, placement=placement)
+    """Certify the grid optimum (or an interval) for n cubes at step dx.
+
+    mu is the base friction (pedestal material and the default cube
+    friction). densities and mu_by_slot are optional per-cube arrays of
+    length n, indexed by sorted-cell position; mu_ground is the optional
+    pedestal-ground friction. All default to the homogeneous scene.
+    """
+    engine = Certifier(
+        n,
+        dx,
+        tol,
+        opts=opts,
+        placement=placement,
+        mu=mu,
+        densities=densities,
+        mu_ground=mu_ground,
+        mu_by_slot=mu_by_slot,
+    )
     return engine.run(max_nodes=max_nodes, time_limit=time_limit, progress=progress)

@@ -130,6 +130,8 @@ class SceneInfo:
     arm_actuators: list = field(default_factory=lambda: [
         f"actuator{i}" for i in range(1, 8)])
     gripper_actuator: str = "actuator8"
+    cells: list = field(default_factory=lambda: list(CELLS))
+    dx: float = DX_GRID
 
 
 # --------------------------------------------------------------------------
@@ -172,28 +174,46 @@ def prop_cert_boxes(scale: float = S) -> list:
 # --------------------------------------------------------------------------
 
 
-def target_world(scale: float = S, base_offset: np.ndarray = BASE_OFFSET
-                 ) -> np.ndarray:
-    """World cube-center targets for the finished structure, build order."""
+def target_world(scale: float = S, base_offset: np.ndarray = BASE_OFFSET,
+                 cells=None, dx: float = DX_GRID) -> np.ndarray:
+    """World cube-center targets for the finished structure, build order.
+
+    cells is a list of (layer, grid_index_j); None uses the archived CELLS.
+    dx is the grid step in keystone units (DX_GRID = 1/24 by default). The two
+    defaults reproduce the clamp 29/24 targets exactly."""
+    cells = CELLS if cells is None else list(cells)
     out = []
-    for (layer, j) in CELLS:
-        out.append(np.array([j * DX_GRID * scale, 0.0, (1.5 + layer) * scale])
+    for (layer, j) in cells:
+        out.append(np.array([j * dx * scale, 0.0, (1.5 + layer) * scale])
                    + base_offset)
     return np.array(out)
 
 
-def staging_world(scale: float = S) -> np.ndarray:
-    """World cube-center poses in the staging row (on the floor)."""
+def staging_world(scale: float = S, cells=None, staging_x=None,
+                  staging_y: float = STAGING_Y) -> np.ndarray:
+    """World cube-center poses in the staging row (on the floor).
+
+    cells sets the cube count; None uses CELLS. staging_x is the per-cube x row
+    (world meters); None uses the archived STAGING_X. Defaults reproduce the
+    clamp 29/24 staging exactly."""
+    cells = CELLS if cells is None else list(cells)
+    xs = STAGING_X if staging_x is None else np.asarray(staging_x, dtype=np.float64)
     half = 0.5 * scale
-    return np.array([[STAGING_X[i], STAGING_Y, half] for i in range(len(CELLS))])
+    return np.array([[xs[i], staging_y, half] for i in range(len(cells))])
 
 
 def scaled_props(scale: float = S, base_offset: np.ndarray = BASE_OFFSET,
-                 relief: float = PROP_RELIEF) -> list:
-    """Prop metadata in world coordinates, tops set from the cube targets."""
-    tgt = target_world(scale, base_offset)
+                 relief: float = PROP_RELIEF, prop_specs=None, cells=None,
+                 dx: float = DX_GRID) -> list:
+    """Prop metadata in world coordinates, tops set from the cube targets.
+
+    prop_specs is a list of unit-scale prop dicts (PROPS_UNIT format: name, x,
+    half_h, z, axis, retract_disp, supports); None uses PROPS_UNIT, and [] means
+    no props. supports indexes into cells. Defaults reproduce clamp 29/24."""
+    prop_specs = PROPS_UNIT if prop_specs is None else list(prop_specs)
+    tgt = target_world(scale, base_offset, cells=cells, dx=dx)
     props = []
-    for k, p in enumerate(PROPS_UNIT):
+    for k, p in enumerate(prop_specs):
         sup = p["supports"]
         cube_bottom = float(tgt[sup][2] - 0.5 * scale)  # underside of the cube
         half_h = p["half_h"] * scale
@@ -243,6 +263,11 @@ def compose_scene(
     grip_kv: float = 30.0,
     arm_base_pos: np.ndarray | None = None,
     arm_base_yaw: float = 0.0,
+    cells=None,
+    cell_names=None,
+    dx: float = DX_GRID,
+    prop_specs=None,
+    staging=None,
 ):
     """Compose the full build scene in memory. Returns (spec, SceneInfo).
 
@@ -257,10 +282,21 @@ def compose_scene(
     origin, reproducing the top-down front build of examples/franka_build.py. A
     non-None arm_base_pos moves the base to that world point; arm_base_yaw
     rotates it about world z (radians) so the arm faces the structure. The
-    structure, staging, and props are unaffected; only the arm is repositioned."""
+    structure, staging, and props are unaffected; only the arm is repositioned.
+
+    cells, cell_names, dx, prop_specs, staging generalize the structure to an
+    arbitrary build plan (the pipeline Franka executor). Defaults (all None, dx
+    = DX_GRID) reproduce the archived clamp 29/24 scene bit for bit. cells is a
+    list of (layer, grid_index_j) in build order; cell_names names them; dx is
+    the grid step in keystone units; prop_specs is a list of unit-scale prop
+    dicts ([] means no props); staging is an (N, 3) world staging row (None uses
+    the default staging_world)."""
     import mujoco
 
     base_offset = np.asarray(base_offset, dtype=np.float64)
+    cells = list(CELLS) if cells is None else list(cells)
+    cell_names = list(CELL_NAMES) if cell_names is None else list(cell_names)
+    prop_specs = list(PROPS_UNIT) if prop_specs is None else list(prop_specs)
     spec = mujoco.MjSpec.from_file(PANDA_XML)
     if arm_base_pos is not None:
         link0 = spec.body("link0")
@@ -317,9 +353,12 @@ def compose_scene(
     pg.rgba = [0.55, 0.57, 0.60, 1.0]
 
     # Design cubes as free bodies, starting in the staging row.
-    staging = staging_world(scale)
+    if staging is None:
+        staging = staging_world(scale, cells=cells)
+    else:
+        staging = np.asarray(staging, dtype=np.float64)
     cube_bodies, cube_geoms = [], []
-    for i, name in enumerate(CELL_NAMES):
+    for i, name in enumerate(cell_names):
         b = wb.add_body()
         b.name = f"cube{i}"
         b.pos = staging[i].tolist()
@@ -332,13 +371,14 @@ def compose_scene(
         g.contype = 0
         g.conaffinity = 0
         # Distinct colors so the render reads the build order.
-        hue = 0.2 + 0.6 * i / max(1, len(CELL_NAMES) - 1)
+        hue = 0.2 + 0.6 * i / max(1, len(cell_names) - 1)
         g.rgba = [hue, 0.45, 1.0 - hue, 1.0]
         cube_bodies.append(b.name)
         cube_geoms.append(g.name)
 
     # Falsework props on sliders with position actuators.
-    props = scaled_props(scale, base_offset, relief)
+    props = scaled_props(scale, base_offset, relief, prop_specs=prop_specs,
+                         cells=cells, dx=dx)
     axis_vec = {"x": [1.0, 0.0, 0.0], "z": [0.0, 0.0, 1.0]}
     for p in props:
         pb = wb.add_body()
@@ -431,14 +471,16 @@ def compose_scene(
         tcp_site=TCP_SITE,
         cube_bodies=cube_bodies,
         cube_geoms=cube_geoms,
-        cube_names=list(CELL_NAMES),
+        cube_names=list(cell_names),
         staging_world=staging,
-        target_world=target_world(scale, base_offset),
+        target_world=target_world(scale, base_offset, cells=cells, dx=dx),
         finger_pads=finger_pads,
         props=props,
         floor="floor",
         pedestal_body="pedestal",
         cube_side=scale,
+        cells=list(cells),
+        dx=dx,
     )
     return spec, info
 

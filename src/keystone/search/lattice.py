@@ -9,7 +9,7 @@ single jitted, vmapped kernel. Fixed padded shapes keep the kernel device
 agnostic: the same code runs on CPU now and on a GPU later.
 
 Scene (frozen, identical physics to the naive script):
-- 2D, xz plane, gravity along -z, mu = 0.7 everywhere.
+- 2D, xz plane, gravity along -z, mu = 0.7 everywhere by default.
 - Pedestal box 6 wide, 1 tall, right edge at x = 0, on the ground z = 0.
   Node 1. Its bottom face is one ground patch (node pair (0, 1)).
 - Unit cubes at layer L have center z = 1.5 + L and center x = j * dx,
@@ -42,9 +42,22 @@ here. The naive script allows it, but a shared vertical face adds a patch
 the two-supports bound does not budget for, and touching never helps
 overhang. Excluding it keeps P_max tight and keeps build_system an exact
 match of the certified host pipeline.
+
+Heterogeneous materials. LatticeSpec carries optional per-cube density
+(densities) and per-cube friction (mu_by_slot), plus a pedestal-ground
+friction knob (mu_ground). Each array holds one value per placement slot.
+build_system sorts the active slots by (layer, xidx) and carries each
+cube's density and friction with it through that sort, so material follows
+the cube. A patch between two cubes takes the min of the two cube
+frictions; a pedestal-cube patch takes the min of the cube friction and
+mu (the pedestal material); the ground patch takes mu_ground (or mu). The
+min-combination is the conservative choice and differs from MuJoCo pair
+friction; see docs/KNOWN_LIMITS.md. All fields default to None, which
+reproduces the homogeneous scene bit for bit.
 """
 
 import functools
+import math
 from dataclasses import dataclass
 
 import jax
@@ -84,6 +97,14 @@ class LatticeSpec:
     forbidding slides under layer-(L+1) bridges anywhere on the corridor.
     mode is a compile-time constant, so the "static" path traces the same
     graph as before this field existed.
+
+    densities, mu_by_slot, and mu_ground carry heterogeneous materials.
+    densities holds one cube density per placement slot (length n_max),
+    mu_by_slot one cube friction per slot, mu_ground the pedestal-ground
+    friction. Each is a compile-time constant. All default to None, the
+    homogeneous scene (spec.density, spec.mu, mu on the ground), traced bit
+    for bit as before these fields existed. See build_system for the
+    min-combination rule on shared patches.
     """
 
     n_max: int
@@ -93,6 +114,9 @@ class LatticeSpec:
     x_hi: float = X_HI
     mu: float = MU
     density: float = DENSITY
+    densities: tuple | None = None
+    mu_ground: float | None = None
+    mu_by_slot: tuple | None = None
     g: float = DEFAULT_G
     ped_left: float = PED_LEFT
     ped_right: float = PED_RIGHT
@@ -105,6 +129,37 @@ class LatticeSpec:
                 "mode must be 'static', 'drop', 'slide', or 'slide_clear', "
                 f"got {self.mode!r}"
             )
+        # Coerce material tuples to hashable float tuples so the spec stays
+        # a valid static (hashable) jit key, and validate lengths and signs.
+        if self.densities is not None:
+            dens = tuple(float(d) for d in self.densities)
+            if len(dens) != self.n_max:
+                raise ValueError(
+                    f"densities must have length n_max={self.n_max}, "
+                    f"got {len(dens)}"
+                )
+            if any((not math.isfinite(d)) or d <= 0.0 for d in dens):
+                raise ValueError(
+                    f"densities must be finite and positive, got {dens}"
+                )
+            object.__setattr__(self, "densities", dens)
+        if self.mu_by_slot is not None:
+            mus = tuple(float(m) for m in self.mu_by_slot)
+            if len(mus) != self.n_max:
+                raise ValueError(
+                    f"mu_by_slot must have length n_max={self.n_max}, "
+                    f"got {len(mus)}"
+                )
+            if any((not math.isfinite(m)) or m < 0.0 for m in mus):
+                raise ValueError(
+                    f"mu_by_slot must be finite and >= 0, got {mus}"
+                )
+            object.__setattr__(self, "mu_by_slot", mus)
+        if self.mu_ground is not None:
+            mg = float(self.mu_ground)
+            if (not math.isfinite(mg)) or mg < 0.0:
+                raise ValueError(f"mu_ground must be finite and >= 0, got {mg}")
+            object.__setattr__(self, "mu_ground", mg)
 
     @property
     def j_lo(self) -> int:
@@ -347,9 +402,18 @@ def patch_table(spec: LatticeSpec, state: State) -> PatchTable:
     cube_com = jnp.stack([s_x, jnp.zeros(n), 1.5 + s_layf], axis=1)
     com = jnp.concatenate([ped_com[None, :], cube_com], axis=0)  # (nb, 3)
     block_mask = jnp.concatenate([jnp.array([True]), s_msk])  # (nb,)
+    # Per-slot cube mass. densities is one value per placement slot; the
+    # sort permutation carries each cube's density with it, so cube_mass_vec
+    # lands in sorted block order. None keeps the homogeneous mass bit for
+    # bit (a dead-simple jnp.full of the single cube mass).
+    if spec.densities is None:
+        cube_mass_vec = jnp.full(n, spec.cube_mass)
+    else:
+        s_dens = jnp.asarray(spec.densities, dtype=jnp.float64)[order]
+        cube_mass_vec = s_dens * 1.0 * 1.0  # unit cube volume, unit depth
     mass = jnp.where(
         block_mask,
-        jnp.concatenate([jnp.array([spec.ped_mass]), jnp.full(n, spec.cube_mass)]),
+        jnp.concatenate([jnp.array([spec.ped_mass]), cube_mass_vec]),
         0.0,
     )
 
@@ -420,7 +484,27 @@ def patch_table(spec: LatticeSpec, state: State) -> PatchTable:
 
     # Masked patches carry mu = 0 (their columns are zero and the P4
     # regularizer drives their variables to zero).
-    mu_vec = jnp.where(patch_active, spec.mu, 0.0)
+    if spec.mu_by_slot is None and spec.mu_ground is None:
+        # Homogeneous friction, bit for bit as before these fields existed.
+        mu_vec = jnp.where(patch_active, spec.mu, 0.0)
+    else:
+        # Per-patch friction by the conservative min-combination. Each cube
+        # has a material friction (mu_by_slot, or mu when None), sorted the
+        # same way as the blocks. A support material is the pedestal (mu) or
+        # a lower cube. A patch takes the min of its two block materials; the
+        # ground patch (slot 0) takes mu_ground (or mu).
+        if spec.mu_by_slot is None:
+            cube_mat = jnp.full(n, spec.mu)
+        else:
+            cube_mat = jnp.asarray(spec.mu_by_slot, dtype=jnp.float64)[order]
+        low_mat = jnp.concatenate([jnp.array([spec.mu]), cube_mat])  # (nb,)
+        g_mat = jnp.sum(selg * low_mat[None, None, :], axis=2)  # (n, 2)
+        c_mu = jnp.minimum(cube_mat[:, None], g_mat)  # (n, 2)
+        ground_mu = spec.mu if spec.mu_ground is None else spec.mu_ground
+        patch_mu = jnp.concatenate(
+            [jnp.array([ground_mu]), c_mu.reshape(-1), jnp.array([0.0])]
+        )
+        mu_vec = jnp.where(patch_active, patch_mu, 0.0)
     return PatchTable(
         com=com,
         block_mask=block_mask,
@@ -835,6 +919,32 @@ def batch_states(spec: LatticeSpec, keys):
         placed_mask=jnp.asarray(msk),
         count=jnp.asarray(cnt),
     )
+
+
+def host_mu_fn(mu: float, mu_ground, cube_materials):
+    """Build a mu_fn(i, j) for build_assembly matching build_system's rule.
+
+    cube_materials is the cube material friction in host block order: the
+    cube at node b + 2 has material cube_materials[b], the pedestal (node 1)
+    has material mu. The ground-pedestal patch (node 0 on one side) takes
+    mu_ground when set, else mu. Every pedestal-cube or cube-cube patch takes
+    the min of its two node materials, the same conservative combination
+    build_system applies per patch. Note MuJoCo combines pair friction
+    differently (a per-pair override or a geometric/elliptic mean), so a
+    MuJoCo replay of the same scene need not agree with this min rule.
+    """
+    ground = mu if mu_ground is None else float(mu_ground)
+    mats = [float(m) for m in cube_materials]
+
+    def material(node: int) -> float:
+        return mu if node == 1 else mats[node - 2]
+
+    def mu_fn(i: int, j: int) -> float:
+        if i == 0:
+            return ground
+        return min(material(i), material(j))
+
+    return mu_fn
 
 
 def harmonic(n: int) -> float:

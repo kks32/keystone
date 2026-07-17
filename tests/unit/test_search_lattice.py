@@ -23,6 +23,7 @@ from keystone.search import lattice as LT
 TOL = Tolerances()
 DX = 1.0 / 24.0
 MU = 0.7
+DENSITY = LT.DENSITY
 SOLVER_TOL = 1e-9
 MAX_ITER = 100
 
@@ -559,3 +560,151 @@ class TestShapesAndKernel:
             solver_tol=SOLVER_TOL, max_iter=MAX_ITER,
         )
         assert np.max(np.abs(margins[idx] - np.asarray(m2))) < 1e-9
+
+
+# =========================================================================
+# Heterogeneous materials: per-slot density and friction.
+# =========================================================================
+
+
+def host_system_hetero(spec, placements, densities, mu, mu_ground, mu_by_slot):
+    """Host (A, w, G) for a state under heterogeneous materials.
+
+    placements is the slot-order list of (layer, index) cells. densities and
+    mu_by_slot are per placement slot. The cubes are sorted by (layer, index)
+    to fix node ids, and each cube carries its own slot's density and
+    friction through that sort, matching build_system. Friction combines by
+    the min rule via LT.host_mu_fn. This is the independent reference the
+    lattice per-slot path is pinned against.
+    """
+    order = sorted(range(len(placements)), key=lambda i: placements[i])
+    boxes = [box_2d(6, 1, -3, 0.5, density=spec.density)]
+    cube_materials = []
+    for oi in order:
+        (L, j) = placements[oi]
+        boxes.append(box_2d(1, 1, j * DX, 1.5 + L, density=densities[oi]))
+        cube_materials.append(mu_by_slot[oi])
+    mu_fn = LT.host_mu_fn(mu, mu_ground, cube_materials)
+    asm = build_assembly(
+        boxes, mu=mu, tol=TOL, dim=2, mu_fn=mu_fn,
+        pad_blocks=spec.n_blocks, pad_patches=spec.P_max, pad_verts=2,
+    )
+    return asm, assemble(asm, TOL, cone="linear2d")
+
+
+class TestHeterogeneousAgreement:
+    """Correctness gate for per-slot density and friction.
+
+    For 50 random reachable states, each built in a shuffled placement order
+    so the sort gather is exercised, the lattice per-slot build_system margins
+    match the certified host pipeline to 1e-9, and the certified flags match
+    exactly. densities are random in [500, 4000], per-slot mu random in
+    [0.3, 1.0], with a separate ground friction.
+    """
+
+    def test_margins_agree_hetero(self):
+        import jax.numpy as jnp
+
+        n_max = 5
+        rng = np.random.default_rng(7)
+        densities = tuple(float(d) for d in rng.uniform(500.0, 4000.0, n_max))
+        mu_by_slot = tuple(float(m) for m in rng.uniform(0.3, 1.0, n_max))
+        mu = 0.7
+        mu_ground = float(rng.uniform(0.3, 1.0))
+        spec = LT.LatticeSpec(
+            n_max=n_max, dx=DX, mu=mu, densities=densities,
+            mu_ground=mu_ground, mu_by_slot=mu_by_slot,
+        )
+
+        # Generate reachable sets, then shuffle each into a placement order.
+        keys = random_reachable_states(spec, 50, seed=0)
+        placements_list = []
+        for key in keys:
+            cells = list(key)
+            rng.shuffle(cells)
+            placements_list.append(cells)
+
+        # Mine, batched through the certified lattice path.
+        states = LT.stack_states(
+            [LT.state_from_placements(spec, p) for p in placements_list]
+        )
+        m_mine, cert_mine = LT.margins_of_states(
+            spec, states, TOL.eps_reg, TOL.tol_cone,
+            solver_tol=SOLVER_TOL, max_iter=MAX_ITER,
+        )
+        m_mine = np.asarray(m_mine)
+        cert_mine = np.asarray(cert_mine)
+
+        # Host, batched through margin_batch on the same systems.
+        As, ws, Gs = [], [], []
+        for placements in placements_list:
+            _asm, hsys = host_system_hetero(
+                spec, placements, densities, mu, mu_ground, mu_by_slot
+            )
+            As.append(hsys.A)
+            ws.append(hsys.w_dead)
+            Gs.append(hsys.G)
+        m_host, cert_host = margin_batch(
+            jnp.stack(As), jnp.stack(ws), jnp.stack(Gs),
+            TOL.eps_reg, tol_cone=TOL.tol_cone, max_iter=MAX_ITER,
+        )
+        m_host = np.asarray(m_host)
+        cert_host = np.asarray(cert_host)
+
+        assert np.max(np.abs(m_mine - m_host)) < 1e-9
+        assert np.array_equal(cert_mine, cert_host)
+
+    def test_equal_materials_match_homogeneous_bitwise(self):
+        # Explicit all-equal materials degenerate to the homogeneous scene
+        # bit for bit: same (A, w, G, L, W) as the default (None) spec.
+        n_max = 4
+        spec0 = LT.LatticeSpec(n_max=n_max, dx=DX)
+        spec1 = LT.LatticeSpec(
+            n_max=n_max, dx=DX, densities=(DENSITY,) * n_max,
+            mu_by_slot=(MU,) * n_max, mu_ground=MU,
+        )
+        key = [(0, -2), (1, -14), (2, -4), (1, 19)]
+        A0, w0, G0, L0, W0 = LT.build_system(spec0, LT.state_from_placements(spec0, key))
+        A1, w1, G1, L1, W1 = LT.build_system(spec1, LT.state_from_placements(spec1, key))
+        assert np.array_equal(np.asarray(A0), np.asarray(A1))
+        assert np.array_equal(np.asarray(w0), np.asarray(w1))
+        assert np.array_equal(np.asarray(G0), np.asarray(G1))
+        assert float(L0) == float(L1) and float(W0) == float(W1)
+
+
+class TestBallastDirection:
+    """Hand-check: heavier ballast raises the P4 feasibility of a reacher.
+
+    A reacher cube overhangs the pedestal right edge and would tip; a
+    counterweight cube sits on it, shifted left. As the counterweight density
+    rises the combined center of mass moves back over the support, so the P4
+    margin falls monotonically and the state flips from infeasible to
+    feasible. The margin ordering is the assertion.
+    """
+
+    def test_heavier_ballast_lowers_margin(self):
+        # Reacher (0, 7) at x = +0.2917 on the pedestal; ballast (1, -5) at
+        # x = -0.2083 resting on it. Sorted-cell order puts the reacher at
+        # slot 0 and the ballast at slot 1, so densities[1] is the ballast.
+        key = [(0, 7), (1, -5)]
+        cw_densities = [500.0, 1000.0, 2000.0, 4000.0, 8000.0]
+        margins = []
+        feasibles = []
+        for d_cw in cw_densities:
+            spec = LT.LatticeSpec(n_max=2, dx=1.0 / 24.0, densities=(2000.0, d_cw))
+            st = LT.state_from_placements(spec, key)
+            m, c = LT.margins_of_states(
+                spec, LT.stack_states([st]), TOL.eps_reg, TOL.tol_cone,
+                solver_tol=SOLVER_TOL, max_iter=MAX_ITER,
+            )
+            m = float(np.asarray(m)[0])
+            c = bool(np.asarray(c)[0])
+            margins.append(m)
+            feasibles.append((m <= TOL.tol_feas) and c)
+
+        # Margin is strictly decreasing in ballast mass.
+        for a, b in zip(margins, margins[1:]):
+            assert b < a + 1e-12, margins
+        # The light ballast cannot hold the reacher; the heavy ballast can.
+        assert not feasibles[0]
+        assert feasibles[-1]

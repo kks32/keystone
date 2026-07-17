@@ -130,11 +130,19 @@ def build_assembly(
     pad_blocks: int | None = None,
     pad_patches: int | None = None,
     pad_verts: int | None = None,
+    mu_fn=None,
 ) -> Assembly:
     """Detect interfaces between boxes (and the ground plane z = 0) and
     build the padded Assembly. Host-mode numpy; deterministic.
 
     pad_* of None means no padding beyond the detected counts.
+
+    mu_fn is an optional callable mapping a node pair (i, j) with i < j
+    (0 = ground) to the friction of that patch. None (the default) gives
+    every patch the scalar mu, bit for bit as before. mu_fn is the minimal
+    hook for heterogeneous friction: it keeps the fragile job of aligning a
+    per-patch array to the detected patch order out of the caller, because
+    the caller keys friction on the stable node pair instead.
     """
     if dim not in (2, 3):
         raise ValueError(f"dim must be 2 or 3, got {dim}")
@@ -202,7 +210,7 @@ def build_assembly(
         nv = pverts.shape[0]
         verts[p, :nv] = pverts
         vert_mask[p, :nv] = True
-        mu_arr[p] = mu
+        mu_arr[p] = mu if mu_fn is None else float(mu_fn(int(i), int(j)))
 
     return Assembly(
         block_mask=block_mask,

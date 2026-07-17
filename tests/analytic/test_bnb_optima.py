@@ -236,3 +236,44 @@ def test_bnb_static_short_run_matches_prechange_counts():
     assert res.closed_size == 254
     assert res.host_verifications == 5
     assert res.host_verified
+
+
+def test_bnb_equal_materials_match_default_baseline():
+    # Passing explicit all-equal materials (every cube density 2000, every
+    # cube friction 0.7, ground 0.7) exercises the heterogeneous code path
+    # but is physically the homogeneous scene, so it must reproduce the
+    # recorded n=3 baseline node for node and solve for solve. This pins the
+    # heterogeneous branch to degenerate exactly onto the default.
+    res = bnb.certify(
+        3, 1.0 / 12.0, TOL, opts=SolverOptions(), progress=False,
+        mu=0.7, densities=(2000.0, 2000.0, 2000.0),
+        mu_by_slot=(0.7, 0.7, 0.7), mu_ground=0.7,
+    )
+    assert res.certified and res.stop_reason == "optimal"
+    assert abs(res.optimum - 5.0 / 6.0) < 1e-9
+    assert [tuple(a) for a in res.sequence] == [(0, -4), (1, 0), (2, 4)]
+    assert res.nodes_expanded == 254
+    assert res.nodes_generated == 1085
+    assert res.qp_solves == 2002
+    assert res.closed_size == 254
+    assert res.host_verifications == 5
+    assert res.host_verified
+
+
+def test_bnb_heavy_ballast_beats_light_at_n3():
+    # A directional material check through the full certifier. At n=3 on the
+    # 1/12 grid, an inventory with the heavy cubes assigned to the low, left
+    # (ballast) sorted cells certifies a larger overhang than the same
+    # multiset with the heavy cubes on the high, right (reacher) cells. Both
+    # are host-verified certified optima. Heavy-as-ballast wins.
+    heavy_back = bnb.certify(
+        3, 1.0 / 12.0, TOL, opts=SolverOptions(), progress=False,
+        densities=(4000.0, 4000.0, 1000.0),
+    )
+    heavy_front = bnb.certify(
+        3, 1.0 / 12.0, TOL, opts=SolverOptions(), progress=False,
+        densities=(1000.0, 1000.0, 4000.0),
+    )
+    assert heavy_back.certified and heavy_back.host_verified
+    assert heavy_front.certified and heavy_front.host_verified
+    assert heavy_back.optimum >= heavy_front.optimum

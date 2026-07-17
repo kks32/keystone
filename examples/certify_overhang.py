@@ -39,6 +39,16 @@ def dx_denom(dx: float) -> int:
     return round(1.0 / dx)
 
 
+def parse_floats(value):
+    """Parse a comma-separated float list, or None for an empty argument."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    return tuple(float(x) for x in s.split(","))
+
+
 def seq_records(sequence, dx):
     """Sequence as simple JSON records: layer, grid index j, center x."""
     return [{"layer": int(L), "j": int(j), "x": j * dx} for (L, j) in sequence]
@@ -89,6 +99,16 @@ def main():
                         choices=["static", "slide", "slide_clear", "drop"],
                         default="static",
                         help="per-step reachability rule enforced by the search")
+    parser.add_argument("--mu", type=float, default=LT.MU,
+                        help="base friction (pedestal material, default cube mu)")
+    parser.add_argument("--densities", type=str, default=None,
+                        help="comma list of n cube densities kg/m^3, by "
+                             "sorted-cell position (default all 2000)")
+    parser.add_argument("--mu-ground", type=float, default=None,
+                        help="pedestal-ground friction (default = mu)")
+    parser.add_argument("--mu-by-slot", type=str, default=None,
+                        help="comma list of n cube frictions, by sorted-cell "
+                             "position (default all mu)")
     parser.add_argument("--time-limit", type=float, default=None,
                         help="wall-clock budget in seconds")
     parser.add_argument("--max-nodes", type=int, default=None,
@@ -108,6 +128,13 @@ def main():
     opts = SolverOptions(solver_tol=args.solver_tol, max_iter=args.max_iter)
     base = LT.harmonic(args.n)
 
+    densities = parse_floats(args.densities)
+    mu_by_slot = parse_floats(args.mu_by_slot)
+    if densities is not None and len(densities) != args.n:
+        parser.error(f"--densities needs {args.n} values, got {len(densities)}")
+    if mu_by_slot is not None and len(mu_by_slot) != args.n:
+        parser.error(f"--mu-by-slot needs {args.n} values, got {len(mu_by_slot)}")
+
     tag = "" if args.placement == "static" else f"_{args.placement}"
     out = args.out or f"out/search/certify_n{args.n}_dx{den}{tag}.json"
 
@@ -117,9 +144,18 @@ def main():
         f"max_iter={opts.max_iter}",
         flush=True,
     )
+    print(
+        f"materials: mu={args.mu} mu_ground={args.mu_ground} "
+        f"densities={densities} mu_by_slot={mu_by_slot}",
+        flush=True,
+    )
     print(f"harmonic(n) sum(1/2k) = {base:.6f} block widths", flush=True)
 
-    engine = bnb.Certifier(args.n, dx, tol, opts=opts, placement=args.placement)
+    engine = bnb.Certifier(
+        args.n, dx, tol, opts=opts, placement=args.placement,
+        mu=args.mu, densities=densities, mu_ground=args.mu_ground,
+        mu_by_slot=mu_by_slot,
+    )
     res = engine.run(max_nodes=args.max_nodes, time_limit=args.time_limit)
 
     print("")
@@ -153,6 +189,10 @@ def main():
         "n": res.n,
         "dx": res.dx,
         "placement": res.placement,
+        "mu": args.mu,
+        "mu_ground": args.mu_ground,
+        "densities": densities,
+        "mu_by_slot": mu_by_slot,
         "certified": res.certified,
         "optimum": res.optimum,
         "lower": res.lower,
@@ -183,8 +223,18 @@ def main():
     print("")
     print(f"wrote {out}")
 
-    update_optima(args.optima, res)
-    print(f"updated {args.optima}")
+    # The accumulating optima archive is keyed on (n, dx, placement) only, so
+    # a heterogeneous run would clobber the homogeneous record under the same
+    # key. Only homogeneous default-material runs update it.
+    homogeneous = (
+        densities is None and mu_by_slot is None
+        and args.mu_ground is None and args.mu == LT.MU
+    )
+    if homogeneous:
+        update_optima(args.optima, res)
+        print(f"updated {args.optima}")
+    else:
+        print(f"skipped {args.optima} (heterogeneous run)")
 
     return 0
 

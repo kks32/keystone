@@ -155,6 +155,40 @@ applied wrenches, arbitrary directions) need `dataclasses.replace` on the
 Not reachable in the cube slice (box faces clip to convex polygons). The v1 policy
 for the mesh pipeline remains: drop polygons with holes and log a warning.
 
+## Heterogeneous lattice materials: sorted-cell assignment and min friction (2026-07-16)
+
+`LatticeSpec` carries optional per-cube density (`densities`), per-cube friction
+(`mu_by_slot`), and a pedestal-ground friction (`mu_ground`), each one value per
+placement slot. Two modeling choices are recorded here.
+
+Material is assigned by sorted-cell position, not by build order. `build_system`
+sorts the active slots by (layer, index) to fix node ids and carries each cube's
+density and friction with it through that sort. The branch-and-bound certifier
+(`keystone.search.bnb`) builds every state from its canonical (sorted) placement
+set, so in a certified run the i-th cube in sorted (layer, index) order takes
+`densities[i]` and `mu_by_slot[i]`. This keeps the assembly of a set a function of
+the set alone, which the closed-list transposition argument needs: two build
+orders of the same set are the same assembly. The cost is that inventory order is
+pinned to the sorted-cell convention. A caller who wants a specific density on a
+specific cube sorts the inventory to place it; a caller who wants to compare
+consumption orders passes different `densities` tuples (the material sweep does
+this). The admissible bound is geometry only and never reads material, so it stays
+valid under any assignment. A cube's material can therefore appear to move between
+prefixes of one build order, because adding a lower-sorted cube shifts the sorted
+positions; this is consistent with how the fast oracle scores each prefix set and
+is re-verified prefix by prefix on the host pipeline.
+
+Patch friction combines by the minimum of the two block materials. A cube-cube
+patch takes `min(mu_i, mu_j)`; a pedestal-cube patch takes `min(mu_cube, mu)` with
+the pedestal material equal to the base `mu`; the ground-pedestal patch takes
+`mu_ground` (or `mu` when unset). The min is the conservative choice: it never
+credits a patch with more friction than its weaker surface can supply. MuJoCo
+combines pair friction differently (a solver-side per-pair override, or a
+geometric or elliptic combine of the two geom frictions), so a MuJoCo replay of
+the same scene need not agree with the min rule at a friction-limited contact. On
+this lattice cubes never touch the ground, so `mu_ground` only ever sets the
+pedestal-ground patch.
+
 ## PDHG screening semantics (2026-07-15)
 
 `solve.pdhg.pdhg_margin` is a fixed-iteration first-order screen of the P4
@@ -581,3 +615,98 @@ one-handed build. 29/24 rams under the arm (bridge 186 mm) exactly as its seated
 knife-edge is scale-marginal in phase 1. Numbers and both-base comparison:
 out/mujoco/mujoco_rideunder.json (phase2.executions); movie
 out/mujoco/rideunder_franka_14.mp4.
+
+## Pipeline Franka executor: the arm executes the exact search sequence (2026-07-16)
+
+examples/pipeline_stack.py --executor franka wires the menagerie Panda into the
+EXECUTE stage of keystone.pipeline. The arm executes the exact sequence the
+search finds (or a fixed control sequence), one protocol per block, at the
+Franka table-top scale (cube side 0.05 m; keystone margins are scale-invariant,
+so the unit-scale certificate carries over). The driver executor stays the
+default; only executor="franka" changes.
+
+Base on the overhang side, reach verified before simulating. The base sits at
+the overhang end (the largest target x) with a y offset of -0.40 m into the free
+corridor and a +90 deg yaw facing the structure, so every approach comes through
+the empty y-corridor and no link arches over the wall. compose_scene grew a
+build-plan parameterization (cells, cell_names, dx, prop_specs, staging) on top
+of the arm_base_pos/arm_base_yaw of the ride-under fix; the no-argument default
+reproduces the archived clamp 29/24 scene bit for bit (test_franka_scene). Every
+waypoint (each staging pick, each drop target, the ride-under start, engage, and
+seat) is checked with damped-least-squares IK before any dynamics; the base
+slides along x by the minimum needed if the overhang end fails reach. For both
+n=4 runs the exact overhang-end base reached every waypoint to under 0.05 mm, so
+nothing moved. The cube supply is restaged on the arm side (-y), past the
+pedestal right edge in +x.
+
+Per-protocol execution. drop runs franka_build's full recipe including the
+closed-loop press (hover correction, iterated alignment, seat press): it fixes
+the 16.7 mm hover offset to 0.2 to 0.4 mm at release, and it seats the knife-edge
+counterweight prop-free to 0.40 mm where the ride-under drop routine (no press)
+missed by 75 mm and toppled. ride_under runs the phase-2 admittance push (tilt
+and force cap from the plan params) followed by a NEW force-capped seat
+correction: a gentle closed-loop press of the reacher toward its certified seat
+along the thread axis. prop stays scene machinery on a slider; the arm drops the
+block onto it and it retracts at the end (falsework protocol). A FrameRecorder
+spans the whole build (video on): MP4 plus GIF plus a final still.
+
+Three-way verdict, distinguished. executor_failed means the arm knocked the
+structure over (a large disturbance of a placed block coincident with pad, hand,
+or drag contact). certified_but_dynamic_fail means the arm placed every block
+without touching the structure but a certified state did not hold prop-free, or
+the as-built structure creep-topples in the stiff settle. agree_stands means the
+arm-built structure clears the stiff settle. An as-built gate flags a block more
+than half a cube from its seat, so a collapsed-but-resting pile no longer reads
+"stable" from the settle test alone.
+
+Run 1, the search optimum (n=4, dx=1/12, sims=2000, seed=0, overhang 1.25,
+prop-free). The arm executes the exact sequence: base 0.22 mm, counterweight
+0.40 mm (both seat and stand prop-free under the press), bridge placed to 1.26 mm
+while gripped. The arm never contacts a placed block (peak arm force 0 N on every
+step). But the prop-free pre-stack [base, counterweight, bridge] is a certified
+zero-margin seesaw (prefix margins 1.7e-12): when the gripper opens, the bridge
+falls to 188 mm and the stack collapses. Not an arm fault (the release is clean),
+so the verdict is certified_but_dynamic_fail, settle rotation 0.26 rad. This
+reproduces, under the arm, the model gap that the driver executor's ride-under
+also hit on this design.
+
+Run 2, the archived 26/24 control (fixed sequence, same base/counterweight/
+bridge geometry as run 1, deeper reacher). The counterweight rides a transient
+falsework prop (prop_steps), as in the archived rideunder build. The arm builds
+it end to end: base 0.22 mm, counterweight-on-prop 0.39 mm, bridge 0.33 mm, all
+prop-free-clean at 0 N arm contact; the ride-under threads the reacher in (push
+6.2 N, cap 9.8 N; bridge dragged 4.6 mm, far under the 30 mm ram threshold) and
+the seat correction closes the reacher offset from 4.16 mm to 0.61 mm; the
+counterweight prop retracts (load 0.44 N) and the structure holds. As-built the
+whole clamp is within 3.7 mm of its certified poses. This is the first complete
+arm build of a keystone overhang design: three drops (one onto a transient prop),
+one ride-under, and a prop retraction, all under one arm on the overhang side,
+geometrically sound. But the seated clamp is a certified zero-margin optimum
+(margin 1.5e-11), and it creep-topples in the stiff settle: rotation 0.024 rad at
+2 s, 0.056 rad at 6 s. Verdict certified_but_dynamic_fail.
+
+The seat correction closes the geometric offset but does not buy dynamic margin,
+and that is the finding. The task premise was that the 4.7 mm ride-under
+push-offset was the settle-marginal cause. Measured, closing it does not help and
+slightly hurts: with the correction the reacher seats to 0.61 mm and the clamp
+creeps 0.024 rad at 2 s; without the correction the reacher stays at 4.16 mm and
+the clamp holds the 2 s settle (0.0075 rad) before creeping to 0.016 rad by 6 s.
+Pressing a zero-margin clamp toward its exact seat perturbs it, and the exact seat
+is the least forgiving point. keystone reports the exact verdict and is not tuned
+toward the simulator, so the correction stays on (it does its mechanical job,
+measured before and after) and the settle verdict is reported as it lands. The
+26/24 seated clamp stands from exact poses at this scale (rideunder, rotation
+3e-4); the arm's millimetre-level as-built error is enough to tip the zero-margin
+optimum. This is the same knife-edge model gap recorded above, now measured at the
+arm level.
+
+Verdict. The arm on the overhang side executes the pipeline's exact sequences,
+places every block without knocking the structure over, and builds the 26/24
+clamp geometrically to under 4 mm with the ride-under seat corrected to sub-
+millimetre. No arm-built structure clears the stiff settle: the certified
+zero-margin optima are settle-marginal under MuJoCo's compliant contacts exactly
+as the model gap predicts, run 1's prop-free pre-stack collapsing at the bridge
+release and run 2's propped clamp creep-toppling after retraction. Numbers, base
+poses, reach margins, and per-block tables: out/pipeline/pipeline_n4_seed0_franka
+.json (run 1) and out/pipeline/pipeline_n4_seed0_franka_ctrl26_24.json (run 2);
+movies alongside as .mp4 and .gif.
