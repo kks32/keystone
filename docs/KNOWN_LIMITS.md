@@ -94,14 +94,14 @@ narrow-phase separating-axis test lands with the mesh pipeline (M2 onward).
 
 ## Verdicts at exact analytic boundaries (2026-07-15)
 
-At a mathematically exact limit state (corbel scale c = 1.0), the P4 margin lands
+At a mathematically exact limit state (corbel scale c = 1.0), the elastic margin lands
 within the tolerance band around `tol_feas` and the verdict is band-sensitive.
 This is inherent to floating point limit analysis, not a bug. Gates therefore
 assert strictly inside and outside the boundary (c = 1 +- 1e-3). Callers should
 treat `|margin - tol_feas| < 10 * tol_feas` as an escalation band and re-verify
 with `solve_p0_exact`.
 
-## P4 feasible-side margin equals the Tikhonov bias (2026-07-15)
+## margin-solver feasible-side margin equals the Tikhonov bias (2026-07-15)
 
 At a feasible state the elastic QP optimum does not reach s = 0; it stops at a
 bias linear in `eps_reg` and proportional to the squared contact force norm
@@ -191,7 +191,7 @@ pedestal-ground patch.
 
 ## PDHG screening semantics (2026-07-15)
 
-`solve.pdhg.pdhg_margin` is a fixed-iteration first-order screen of the P4
+`solve.pdhg.pdhg_margin` is a fixed-iteration first-order screen of the elastic-margin program
 problem, not a certifier. FEASIBLE claims that reach a user always come from the
 certified path (`margin_core` plus the verified verdict, or `solve_p0_exact`).
 The search (`search.mcts`, `screener="pdhg"`) uses screened margins for expansion
@@ -236,7 +236,7 @@ infeasible state stays finite and tracks the true residual infimum from above.
 
 ## MuJoCo soft contacts topple knife-edge certified optima (2026-07-16)
 
-The certified overhang optima are exact limit states. Their P4 elastic margins
+The certified overhang optima are exact limit states. Their elastic margins
 are near machine zero (corbel c=0.98: 3e-11; clamp 31/24: 2e-11; n=6 4/3: 3e-11),
 which certifies static equilibrium but signals zero margin to perturbation.
 MuJoCo's default contact model is soft (solref time constant 0.02 s). Under it
@@ -256,11 +256,11 @@ add a margin floor to the objective.
 ## Lam-reserve certification predicts compliant-physics survival (2026-07-17)
 
 Static feasibility alone does not predict whether a certified structure stands
-in compliant physics. Every feasible design has a near-zero P4 margin at zero
+in compliant physics. Every feasible design has a near-zero elastic margin at zero
 load, so the margin at lam=0 cannot tell a knife edge from a design with reserve.
 The distinguishing quantity is the lateral reserve: the largest pseudo-static
 lateral load, as a fraction of self-weight, the structure carries while staying
-certified feasible. A state is "lam-robust" at lam_min when its P4 margin
+certified feasible. A state is "lam-robust" at lam_min when its elastic margin
 certifies feasible under both +lam_min and -lam_min lateral load; the symmetric
 reserve capacity is min(|lam+|, |lam-|), found by bisecting solve_p4 in each
 direction.
@@ -523,7 +523,7 @@ the lip, so any positive tilt clears it while a flat reacher sits exactly at the
 lip (the zero-clearance jam of the earlier entries).
 
 Scale, stated first. The maneuver runs at the Franka scale (cube side 0.05 m,
-0.25 kg) so push forces are robot-sized. keystone statics are scale-free (the P4
+0.25 kg) so push forces are robot-sized. keystone statics are scale-free (the elastic
 margins below reproduce the unit-scale clamp), but the MuJoCo settle is not: the
 fixed solref time constant is relatively softer at the smaller scale. The
 pre-reacher stack (base, counterweight, bridge) certifies feasible (margin
@@ -559,10 +559,10 @@ cheap.
 
 Bridge return and per-design outcomes (tilt 4, cap 4).
 - 26/24: slips under, reach 0.44 mm, push 0.93 N, bridge returns to 1.6 mm,
-  clamp overlap 10.4 mm, ballast rotation 0.2 deg, seated P4 margin 1.4e-11, and
+  clamp overlap 10.4 mm, ballast rotation 0.2 deg, seated elastic margin 1.4e-11, and
   it STANDS (2 s and 6 s stiff settle). The clean full-height prop-free build.
 - 29/24: slips under just as cleanly, reach 0.42 mm, push 1.0 N, bridge returns
-  to 0.4 mm, overlap 5.3 mm, seated P4 margin 1.7e-11, but the seated knife-edge
+  to 0.4 mm, overlap 5.3 mm, seated elastic margin 1.7e-11, but the seated knife-edge
   creep-topples at the Franka scale (the scale effect above). Certified feasible;
   stands at unit scale.
 - 31/24: the reacher seats under the driver (0.55 mm) but slides out on release
@@ -576,7 +576,7 @@ bridge back before it can walk. A large pivot appears only when the reseat fails
 (the fully tilted reacher, not leveled, drags the bridge off its seat). The
 user-facing visual is the tilted reacher sliding under, not a bridge flap.
 
-Intermediate arm-free certification (P4 margin versus push versus time, host
+Intermediate arm-free certification (elastic margin versus push versus time, host
 pipeline, oriented 2D boxes with the y tilt). Frozen at snapshots, the
 reacher-held states read as external help needed: start and engagement are
 infeasible with margin 0.158 (the dangling reacher needs the hold), the tilted

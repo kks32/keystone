@@ -86,7 +86,7 @@ normals carry the weight. Row 3 with row 1 gives $n_0 = n_1 = mg/2$: a symmetric
 block loads its two corners equally.
 
 Now add a horizontal live load $\lambda\,mg$ at the center of mass, the
-pseudo-static lateral load used by P2. It enters on the force-$x$ row, so
+pseudo-static lateral load used by the load-factor solver. It enters on the force-$x$ row, so
 $w_{\text{live}} = (mg, 0, 0)$ and the balances become
 
 $$u_0 + u_1 = \lambda\,mg, \qquad n_0 + n_1 = mg, \qquad
@@ -180,9 +180,9 @@ the true model; the code marks it `unknown`.
 
 ## 3. The four solvers
 
-### The elastic margin (P4)
+### The elastic margin
 
-P4 measures how far an assembly is from equilibrium inside the cone. The JAX
+The margin solver measures how far an assembly is from equilibrium inside the cone. The JAX
 backend solves the slack quadratic program
 
 $$\min_{f,\,s}\ \tfrac12\lVert s\rVert^2 + \tfrac{\varepsilon}{2}\lVert f\rVert^2
@@ -210,9 +210,9 @@ feasibility threshold $\text{tol\_feas} = 10^{-8}$. Infeasibility residuals are
 independent of $\varepsilon$, so raising or lowering it does not move a
 falls-verdict.
 
-### The feasibility verdict (P0)
+### The feasibility verdict
 
-P0 asks the yes/no question: does an $f \in K$ with $A f + w = 0$ exist. The
+The feasibility verdict asks the yes/no question: does an $f \in K$ with $A f + w = 0$ exist. The
 answer is one of three values, and each is checked before it is returned rather
 than read off a solver flag.
 
@@ -235,7 +235,7 @@ mechanism.
 Anything that passes neither check is NO_CONVERGE. The solver abstains rather
 than guess.
 
-Alongside the verdict, keystone reports whether the P4 iterate is optimal for
+Alongside the verdict, keystone reports whether the margin iterate is optimal for
 (4), beyond being feasible. Optimality is a full Karush-Kuhn-Tucker check on
 the slack program: four residuals, each an infinity norm, must sit below
 $\text{tol\_gap}$.
@@ -266,9 +266,9 @@ $\text{tol\_dual} = 10\,\text{tol\_feas}$, and $\text{tol\_gap} =
 100\,\text{tol\_feas}$. They live in one `Tolerances` dataclass and are passed
 explicitly.
 
-### The load factor (P2)
+### The load factor
 
-P2 finds the largest multiple of a live load the assembly carries:
+The load-factor solver finds the largest multiple of a live load the assembly carries:
 
 $$\lambda^* = \max\{\lambda : A f + w_{\text{dead}} + \lambda\,w_{\text{live}} = 0,
   \ f \in K\}.$$
@@ -276,7 +276,7 @@ $$\lambda^* = \max\{\lambda : A f + w_{\text{dead}} + \lambda\,w_{\text{live}} =
 The default $w_{\text{live}}$ is horizontal pseudo-static gravity, so $\lambda^*$
 is the tilt and pseudo-seismic margin. Feasibility is monotone in $\lambda$:
 because $K$ is convex and the load is affine in $\lambda$, the feasible set is an
-interval $[0, \lambda^*]$ with $\lambda = 0$ feasible. Bisection on the P0
+interval $[0, \lambda^*]$ with $\lambda = 0$ feasible. Bisection on the feasibility
 verdict then converges linearly, and 60 steps resolve $\lambda^*$ to
 $\lambda_{\text{hi}}\,2^{-60}$. A NO_CONVERGE midpoint does not read as
 infeasible; it escalates to the exact LP oracle, and if that also abstains the
@@ -284,11 +284,11 @@ bisection stops and marks the band undecided. The reported factor is the
 largest verified-feasible bracket bound. In 2D with the linear cone it is an
 upper estimate of the true Coulomb capacity (Section 2.4).
 
-### The critical friction (P3)
+### The critical friction
 
-P3 finds the least friction that keeps the assembly standing:
+The critical-friction solver finds the least friction that keeps the assembly standing:
 
-$$\mu^* = \inf\{\mu : \text{P0 is feasible}\}.$$
+$$\mu^* = \inf\{\mu : \text{the assembly is feasible}\}.$$
 
 Feasibility is monotone nondecreasing in $\mu$, because the cones nest:
 $K_{\mu_1} \subseteq K_{\mu_2}$ for $\mu_1 \le \mu_2$, so a feasible force at
@@ -341,19 +341,19 @@ the exact oracle, and only then deciding keeps the proof sound.
 ## 5. Lateral reserve
 
 Static feasibility at zero load does not say how close an assembly is to
-collapse. Every feasible box design has a near-zero P4 margin at rest, so the
+collapse. Every feasible box design has a near-zero elastic margin at rest, so the
 resting margin cannot separate a knife edge from a design with room to spare.
 The separating quantity is the lateral reserve: the largest pseudo-static
 lateral load, as a fraction of self-weight, the assembly carries while staying
 verified feasible.
 
-Solve P4 at $w_{\text{dead}} + \lambda\,w_{\text{live}}$ and at
+Solve the margin program at $w_{\text{dead}} + \lambda\,w_{\text{live}}$ and at
 $w_{\text{dead}} - \lambda\,w_{\text{live}}$, bisecting $\lambda$ in each
 direction to the feasibility boundary. The symmetric reserve is
 
 $$\rho = \min\big(|\lambda_+|,\ |\lambda_-|\big).$$
 
-A state passes the reserve screen at threshold $\lambda_{\min}$ when its P4
+A state passes the reserve screen at threshold $\lambda_{\min}$ when its elastic
 margin verifies feasible under both $+\lambda_{\min}$ and $-\lambda_{\min}$, that
 is when $\rho \ge \lambda_{\min}$.
 
@@ -476,7 +476,7 @@ not. It is admissible.
 
 The bound reads geometry only. It never looks at density or friction, so it
 stays admissible under heterogeneous materials: materials change which
-completions are feasible, decided by the P0 verdict, never the reach ceiling.
+completions are feasible, decided by the feasibility verdict, never the reach ceiling.
 
 ### Monotonicity and optimality
 
@@ -542,7 +542,7 @@ margin head is an auxiliary sigmoid, and its term is masked to rows that carry a
 verified margin, so states the search never solved contribute nothing. The
 weight $w_m$ defaults to $0.5$.
 
-The margin target normalizes the verified P4 margin through a log. A margin
+The margin target normalizes the verified elastic margin through a log. A margin
 $m$ maps to
 
 $$\hat m = \operatorname{clip}\!\left(
